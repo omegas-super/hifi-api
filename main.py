@@ -44,9 +44,7 @@ _proxies: List[str] = []
 # Cache of the last proxy confirmed to be working
 _last_known_good_proxy: Optional[str] = None
 
-# Last Oxaam Tiedla account selected; used to avoid sticking to the same shared
-# account when Oxaam exposes more than one across reloads or fresh sessions.
-_oxaam_last_selected_email: Optional[str] = None
+# Last Oxaam observed credential pool; refreshed on each fetch
 _oxaam_observed_cred_pool: List[dict] = []
 _oxaam_invalid_tidal_emails: set[str] = set()
 
@@ -134,10 +132,6 @@ COUNTRY_CODE = os.getenv("COUNTRY_CODE", "US")
 # The resulting refresh_token is cached in token.json so Oxaam is only hit when needed.
 OXAAM_EMAIL = os.getenv("OXAAM_EMAIL", "")
 OXAAM_PASSWORD = os.getenv("OXAAM_PASSWORD", "")
-OXAAM_BROWSER_SCRAPE = os.getenv("OXAAM_BROWSER_SCRAPE", "False").lower() in ("true", "1", "yes")
-OXAAM_RELOAD_ATTEMPTS = max(1, int(os.getenv("OXAAM_RELOAD_ATTEMPTS", "5")))
-OXAAM_RELOAD_DELAY_MS = max(0, int(os.getenv("OXAAM_RELOAD_DELAY_MS", "700")))
-OXAAM_SESSION_ATTEMPTS = max(1, int(os.getenv("OXAAM_SESSION_ATTEMPTS", "3")))
 
 USE_PROXIES = os.getenv("USE_PROXIES", "False").lower() in ("true", "1", "yes")
 ROTATE_PROXIES_ON_REFRESH = os.getenv("ROTATE_PROXIES_ON_REFRESH", "False").lower() in ("true", "1", "yes")
@@ -373,115 +367,24 @@ async def get_http_client() -> httpx.AsyncClient:
 import re as _re
 
 
-def _fetch_oxaam_tidal_creds_sync() -> tuple:
-    """Login to oxaam.com with OXAAM_EMAIL/OXAAM_PASSWORD and scrape the Tidal
-    (Tiedla) shared account email and password from the free-services page.
+async def _fetch_oxaam_tidal_creds() -> list[dict]:
+    """Login to oxaam.com with OXAAM_EMAIL/OXAAM_PASSWORD and scrape ALL Tidal
+    credentials from the CREDENTIALS JavaScript block on freeservice.php.
 
-    Uses curl_cffi to mimic a real Chrome TLS fingerprint, bypassing Cloudflare.
-    Returns (tidal_email, tidal_password) as strings.
+    The freeservice.php page contains an inline <script> block like:
+        const CREDENTIALS = [{"email":"...","password":"...","link":""}, ...];
+
+    All credentials are returned at once — no reload loop needed.
+    Returns a list of {email, password} dicts.
     """
-    import html as _html
-
+    import json as _json
     from curl_cffi.requests import Session
-    global _oxaam_last_selected_email, _oxaam_observed_cred_pool
 
-    default_headers = {
-        "Cache-Control": "no-cache, no-store, max-age=0",
-        "Pragma": "no-cache",
-        "Referer": "https://www.oxaam.com/freeservice.php",
-    }
+    loop = asyncio.get_event_loop()
 
-    def _extract_tiedla_creds(page_html: str) -> list[dict]:
-        tiedla_idx = page_html.find("Tiedla")
-        if tiedla_idx == -1:
-            raise RuntimeError("Tiedla section not found on freeservice.php — page layout may have changed")
-
-        block = page_html[tiedla_idx : tiedla_idx + 12000]
-        merged_creds: dict[str, dict] = {}
-
-        # Prefer the structured copy-button payloads inside the Tiedla details block.
-        # Oxaam renders the visible credentials as buttons with data-copy attributes,
-        # which is less brittle than scraping raw text.
-        data_copy_values = [
-            _html.unescape(value).strip()
-            for value in _re.findall(r'data-copy=["\']([^"\']+)["\']', block, _re.IGNORECASE)
-        ]
-        paired_creds: list[dict] = []
-        for idx, value in enumerate(data_copy_values):
-            if value.lower().endswith("@oxaam.in") and idx + 1 < len(data_copy_values):
-                paired_creds.append({
-                    "email": value,
-                    "password": data_copy_values[idx + 1],
-                })
-        for cred in paired_creds:
-            merged_creds[cred["email"]] = cred
-
-        visible_email = _re.search(
-            r'Email(?:&nbsp;|\s)*➜(?:\s|&nbsp;|<[^>]+>)*([A-Za-z0-9._%+-]+@oxaam\.in)',
-            block,
-            _re.IGNORECASE,
-        )
-        visible_password = _re.search(
-            r'Password(?:&nbsp;|\s)*➜(?:\s|&nbsp;|<[^>]+>)*([^<\s]+)',
-            block,
-            _re.IGNORECASE,
-        )
-        if visible_email and visible_password:
-            cred = {
-                "email": _html.unescape(visible_email.group(1)).strip(),
-                "password": _html.unescape(visible_password.group(1)).strip(),
-            }
-            merged_creds[cred["email"]] = cred
-
-        match = _re.search(r'const CREDENTIALS\s*=\s*(\[.*?\]);', block, _re.DOTALL)
-        if match:
-            import json as _json
-
-            creds_list = _json.loads(match.group(1))
-            for cred in creds_list:
-                email = _html.unescape(str(cred.get("email", "")).strip())
-                password = _html.unescape(str(cred.get("password", "")).strip())
-                if email and password:
-                    merged_creds[email] = {"email": email, "password": password}
-
-        if merged_creds:
-            return list(merged_creds.values())
-
-        raise RuntimeError("Could not find visible Tiedla credentials on freeservice.php — page layout may have changed")
-
-    def _freeservice_url() -> str:
-        return f"https://www.oxaam.com/freeservice.php?_={int(time.time() * 1000)}_{random.randint(1000, 9999)}"
-
-    def _pick_best_cred(observed_creds: dict[str, dict], observation_order: list[str]) -> dict:
-        valid_observed = {
-            email: cred for email, cred in observed_creds.items()
-            if email not in _oxaam_invalid_tidal_emails
-        }
-        if valid_observed:
-            observed_creds = valid_observed
-            observation_order = [email for email in observation_order if email in observed_creds]
-
-        # Prefer a credential that only appeared after at least one reload, since the
-        # first response is the most likely to be cached/stale.
-        if len(observation_order) > 1:
-            reload_candidates = [email for email in observation_order[1:] if email in observed_creds]
-            if _oxaam_last_selected_email:
-                non_reused = [email for email in reload_candidates if email != _oxaam_last_selected_email]
-                if non_reused:
-                    return observed_creds[non_reused[-1]]
-            if reload_candidates:
-                return observed_creds[reload_candidates[-1]]
-        if _oxaam_last_selected_email:
-            non_reused = [email for email in observation_order if email != _oxaam_last_selected_email and email in observed_creds]
-            if non_reused:
-                return observed_creds[non_reused[-1]]
-        return observed_creds[observation_order[-1]]
-
-    observed_creds: dict[str, dict] = {}
-    observation_order: list[str] = []
-    for session_idx in range(OXAAM_SESSION_ATTEMPTS):
+    def _scrape() -> list[dict]:
         with Session(impersonate="chrome131") as session:
-            # 1. GET the login page first to pick up any session cookies
+            # 1. GET the login page to pick up session cookies
             session.get("https://www.oxaam.com/login.php", timeout=20)
 
             # 2. POST login credentials
@@ -496,154 +399,54 @@ def _fetch_oxaam_tidal_creds_sync() -> tuple:
                 timeout=20,
             )
             if "login.php" in login_res.url:
+                raise RuntimeError("Oxaam login failed — check OXAAM_EMAIL and OXAAM_PASSWORD")
+
+            # 3. Fetch freeservice.php once — no reloads
+            fs_res = session.get(
+                f"https://www.oxaam.com/freeservice.php?_={int(time.time() * 1000)}",
+                timeout=20,
+            )
+
+            # 4. Extract the CREDENTIALS array from the inline <script> block.
+            # Search a generous portion of the page (the script lives near the
+            # Tiedla section, roughly lines 400–420 of the HTML source).
+            match = _re.search(
+                r'const CREDENTIALS\s*=\s*(\[.*?\]);',
+                fs_res.text,
+                _re.DOTALL,
+            )
+            if not match:
                 raise RuntimeError(
-                    "Oxaam login failed — check OXAAM_EMAIL and OXAAM_PASSWORD"
+                    "CREDENTIALS block not found on freeservice.php — page layout may have changed"
                 )
 
-            # 3. Fetch free-services page (session cookie is carried automatically)
-            fs_res = session.get(_freeservice_url(), headers=default_headers, timeout=20)
-            creds_list = _extract_tiedla_creds(fs_res.text)
+            creds_list = _json.loads(match.group(1))
+            result: list[dict] = []
+            seen: set[str] = set()
             for cred in creds_list:
-                observed_creds[cred["email"]] = cred
-                observation_order.append(cred["email"])
-            previous_email = creds_list[0].get("email", "unknown")
+                email = str(cred.get("email", "")).strip()
+                password = str(cred.get("password", "")).strip()
+                if email and password and email not in seen:
+                    seen.add(email)
+                    result.append({"email": email, "password": password})
 
-            for reload_idx in range(OXAAM_RELOAD_ATTEMPTS):
-                refresh_res = session.get(
-                    _freeservice_url(),
-                    headers=default_headers,
-                    timeout=20,
-                )
-                refreshed_creds = _extract_tiedla_creds(refresh_res.text)
-                if not refreshed_creds:
-                    continue
+            if not result:
+                raise RuntimeError("No valid credentials found in CREDENTIALS block")
 
-                current_email = refreshed_creds[0].get("email", "unknown")
-                logger.info(
-                    "Oxaam session %d/%d reload %d/%d: %s -> %s",
-                    session_idx + 1,
-                    OXAAM_SESSION_ATTEMPTS,
-                    reload_idx + 1,
-                    OXAAM_RELOAD_ATTEMPTS,
-                    previous_email,
-                    current_email,
-                )
-                previous_email = current_email
-                for cred in refreshed_creds:
-                    observed_creds[cred["email"]] = cred
-                    observation_order.append(cred["email"])
+            return result
 
-                if OXAAM_RELOAD_DELAY_MS:
-                    time.sleep((OXAAM_RELOAD_DELAY_MS + random.randint(0, 250)) / 1000.0)
-
-    creds_list = list(observed_creds.values())
-    logger.info(
-        "Oxaam observed %d Tiedla account(s): %s",
-        len(creds_list),
-        ", ".join(sorted(cred["email"] for cred in creds_list)),
-    )
-
-    selected_cred = _pick_best_cred(observed_creds, observation_order)
-    _oxaam_last_selected_email = selected_cred["email"]
-    _oxaam_observed_cred_pool = [selected_cred] + [
-        cred for email, cred in observed_creds.items() if email != selected_cred["email"]
-    ]
-    tidal_email = selected_cred["email"]
-    tidal_password = selected_cred["password"]
-    return tidal_email, tidal_password
-
-
-async def _fetch_oxaam_tidal_creds_browser() -> tuple:
-    """Scrape the live Tiedla credentials from Oxaam using a real browser session."""
-    def _parse_creds(text: str) -> Optional[tuple[str, str]]:
-        email_match = _re.search(r"Email\s*➜\s*([^\s]+@oxaam\.in)", text, _re.IGNORECASE)
-        password_match = _re.search(r"Password\s*➜\s*([^\s]+)", text, _re.IGNORECASE)
-        if email_match and password_match:
-            return email_match.group(1).strip(), password_match.group(1).strip()
-        return None
-
-    async def _collect_with_page(page) -> tuple:
-        await page.goto("https://www.oxaam.com/login.php", wait_until="domcontentloaded", timeout=30_000)
-        inputs = page.locator("input:not([type='hidden']):visible")
-        await inputs.nth(0).fill(OXAAM_EMAIL)
-        await inputs.nth(1).fill(OXAAM_PASSWORD)
-        sign_in = page.locator("button:has-text('Sign in')")
-        if await sign_in.count() == 0:
-            sign_in = page.locator("button[type='submit']")
-        await sign_in.first.click()
-        await page.wait_for_function("() => !location.href.includes('login.php')", timeout=20_000)
-
-        await page.goto("https://www.oxaam.com/freeservice.php", wait_until="domcontentloaded", timeout=30_000)
-        more_services = page.locator("button:has-text('Click here for more free services')")
-        if await more_services.count() > 0:
-            try:
-                await more_services.first.click(timeout=5_000)
-            except Exception:
-                pass
-
-        observed_creds: dict[str, tuple[str, str]] = {}
-        previous_email = "unknown"
-        for attempt in range(4):
-            details = page.locator("details").filter(has_text="Tiedla").first
-            await details.wait_for(state="attached", timeout=10_000)
-            details_text = (await details.text_content()) or ""
-            parsed = _parse_creds(details_text)
-            if not parsed:
-                raise RuntimeError("Could not parse Tiedla credentials from Oxaam browser page")
-
-            email, password = parsed
-            observed_creds[email] = (email, password)
-            if attempt > 0:
-                logger.info("Oxaam browser reload: %s -> %s", previous_email, email)
-            previous_email = email
-
-            if attempt < 3:
-                await page.reload(wait_until="domcontentloaded", timeout=30_000)
-
-        emails = sorted(observed_creds)
-        logger.info("Oxaam browser observed %d Tiedla account(s): %s", len(emails), ", ".join(emails))
-        return random.choice(list(observed_creds.values()))
-
-    try:
-        from camoufox.async_api import AsyncCamoufox
-
-        async with AsyncCamoufox(headless=True, os="windows") as browser:
-            page = await browser.new_page()
-            return await _collect_with_page(page)
-    except Exception as camoufox_exc:
-        logger.warning("Oxaam camoufox scrape failed: %s — falling back to patchright browser", camoufox_exc)
-
-    from patchright.async_api import async_playwright
-
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
-        try:
-            page = await browser.new_page(viewport={"width": 1280, "height": 900})
-            return await _collect_with_page(page)
-        finally:
-            await browser.close()
-
-
-async def _fetch_oxaam_tidal_creds() -> tuple:
-    """Async wrapper — runs the blocking curl_cffi scrape in a thread pool, with retries."""
-    loop = asyncio.get_event_loop()
     last_exc: Exception = RuntimeError("No attempts made")
     for attempt in range(1, 4):
         try:
-            if OXAAM_BROWSER_SCRAPE:
-                try:
-                    tidal_email, tidal_password = await _fetch_oxaam_tidal_creds_browser()
-                except Exception as browser_exc:
-                    logger.warning("Oxaam browser scrape failed: %s — falling back to curl session", browser_exc)
-                    tidal_email, tidal_password = await loop.run_in_executor(
-                        None, _fetch_oxaam_tidal_creds_sync
-                    )
-            else:
-                tidal_email, tidal_password = await loop.run_in_executor(
-                    None, _fetch_oxaam_tidal_creds_sync
-                )
-            logger.info("Fetched Tidal credentials from Oxaam (account: %s)", tidal_email)
-            return tidal_email, tidal_password
+            creds = await loop.run_in_executor(None, _scrape)
+            logger.info(
+                "Oxaam: fetched %d Tidal credential(s) from freeservice.php CREDENTIALS block: %s",
+                len(creds),
+                ", ".join(c["email"] for c in creds),
+            )
+            global _oxaam_observed_cred_pool
+            _oxaam_observed_cred_pool = creds
+            return creds
         except Exception as exc:
             last_exc = exc
             logger.warning("Oxaam fetch attempt %d/3 failed: %s — retrying in 8s", attempt, exc)
@@ -653,19 +456,15 @@ async def _fetch_oxaam_tidal_creds() -> tuple:
 
 
 async def _auto_approve_device_link(verify_url: str, email: str, password: str) -> bool:
-    """Auto-approve a Tidal device link fully inside a bot-detection-bypassing browser.
+    """Auto-approve a Tidal device link using Camoufox (patched Firefox).
 
-    PRIMARY: camoufox (patched Firefox, true headless, no Xvfb needed)
-    ===================================================================
-    camoufox patches Firefox's internals to remove all automation signals that
-    DataDome, Cloudflare, and similar systems detect. Works in headless=True mode
+    Camoufox patches Firefox's internals to remove all automation signals that
+    DataDome, Cloudflare, and similar systems detect. Works in true headless mode
     on Railway/Linux without any virtual display — no DISPLAY env var, no Xvfb.
-    https://github.com/daijro/camoufox
 
-    FALLBACK: patchright (patched Chromium, requires display)
-    ==========================================================
-    Used if camoufox is not installed. Requires headless=False with either
-    Xvfb on Linux (DISPLAY=:99) or an off-screen window on Windows.
+    Uses OS spoofing (os="windows") and fingerprint injection for maximum
+    bot-detection bypass. No Patchright fallback — Camoufox is the only path.
+    https://github.com/daijro/camoufox
     """
     full_url = verify_url if verify_url.startswith("http") else f"https://{verify_url}"
 
@@ -682,9 +481,9 @@ async def _auto_approve_device_link(verify_url: str, email: str, password: str) 
             return []
         return [" ".join(text.split()) for text in texts if text and text.strip()]
 
-    async def _submit_email_stage(page, browser_name: str) -> str:
+    async def _submit_email_stage(page) -> str:
         await page.wait_for_selector("#email", timeout=30_000)
-        logger.info("%s: DataDome passed — login page loaded", browser_name)
+        logger.info("Camoufox: DataDome passed — login page loaded")
 
         email_input = page.locator("#email")
         await email_input.fill(email)
@@ -752,42 +551,52 @@ async def _auto_approve_device_link(verify_url: str, email: str, password: str) 
 
         buttons = await _visible_button_texts(page)
         logger.warning(
-            "%s: email step stalled for %s. URL: %s Buttons: %s",
-            browser_name,
+            "Camoufox: email step stalled for %s. URL: %s Buttons: %s",
             email,
             page.url,
             buttons,
         )
         return "stuck"
 
-    # ---- Try camoufox first (true headless, no Xvfb) ----
+    # ---- Camoufox with OS spoofing + fingerprint injection (true headless, no Xvfb) ----
     try:
         from camoufox.async_api import AsyncCamoufox
-        logger.info("Camoufox: starting headless Firefox to approve device link %s", full_url)
-        async with AsyncCamoufox(headless=True, os="windows") as browser:
+    except ImportError:
+        logger.warning("Camoufox not installed — cannot auto-approve device link")
+        return False
+
+    logger.info("Camoufox: starting headless Firefox (os=windows, fingerprint injected) for %s", full_url)
+    try:
+        async with AsyncCamoufox(
+            headless=True,
+            os="windows",
+            block_webrtc=True,
+            disable_coop=True,
+        ) as browser:
             page = await browser.new_page()
             await page.goto(full_url, timeout=30_000, wait_until="domcontentloaded")
-            import asyncio as _asyncio
-            # Give DataDome time to run its JS challenge before looking for the form
+
+            # Give DataDome time to run its JS challenge
             try:
                 await page.wait_for_load_state("networkidle", timeout=15_000)
             except Exception:
                 pass
-            await _asyncio.sleep(2)
+            await asyncio.sleep(2)
 
             # --- Step 1: email ---
             try:
-                email_state = await _submit_email_stage(page, "Camoufox")
+                email_state = await _submit_email_stage(page)
             except Exception as e:
-                logger.warning("Camoufox: email field not found (%s) — falling back to patchright", e)
-                raise  # triggers fallback
+                logger.warning("Camoufox: email field not found (%s)", e)
+                return False
 
             if email_state == "invalid_credentials":
                 _oxaam_invalid_tidal_emails.add(email)
                 logger.warning("Camoufox: Tidal rejected Oxaam credentials for %s", email)
                 return False
             if email_state == "stuck":
-                raise RuntimeError(f"Camoufox email step stalled for {email}")
+                logger.error("Camoufox: email step stalled for %s", email)
+                return False
 
             # --- Step 2: password ---
             if email_state == "password":
@@ -797,7 +606,7 @@ async def _auto_approve_device_link(verify_url: str, email: str, password: str) 
                     logger.info("Camoufox: password submitted — waiting for redirect")
                 except Exception as e:
                     logger.warning("Camoufox: password field not found: %s", e)
-                    raise
+                    return False
             else:
                 logger.info(
                     "Camoufox: password step skipped after email submit (state=%s, url=%s)",
@@ -806,9 +615,6 @@ async def _auto_approve_device_link(verify_url: str, email: str, password: str) 
                 )
 
             # --- Step 3: wait for redirect away from login.tidal.com ---
-            # The login page is login.tidal.com/authorize. After login it redirects
-            # through offer.tidal.com before reaching the device approval page.
-            # A cookie banner may block the redirect — dismiss it first if needed.
             async def _dismiss_cookie_banner() -> bool:
                 """Click Accept only when Reject is also present (cookie banner pattern)."""
                 try:
@@ -831,7 +637,6 @@ async def _auto_approve_device_link(verify_url: str, email: str, password: str) 
             redirected = False
             for _wait_round in range(3):
                 try:
-                    # wait_for_function polls JS — safe cross-origin check
                     await page.wait_for_function(
                         "() => !window.location.href.includes('login.tidal.com')",
                         timeout=10_000,
@@ -839,13 +644,12 @@ async def _auto_approve_device_link(verify_url: str, email: str, password: str) 
                     redirected = True
                     break
                 except Exception:
-                    # Still on login.tidal.com — try dismissing cookie banner then retry
                     await _dismiss_cookie_banner()
                     if await _has_invalid_login_message():
                         _oxaam_invalid_tidal_emails.add(email)
                         logger.warning("Camoufox: Tidal rejected Oxaam credentials for %s", email)
                         return False
-                    await _asyncio.sleep(1)
+                    await asyncio.sleep(1)
 
             if redirected:
                 logger.info("Camoufox: redirected away from login → %s", page.url)
@@ -861,22 +665,19 @@ async def _auto_approve_device_link(verify_url: str, email: str, password: str) 
                 except Exception:
                     pass
 
-            # --- Step 4: wait for page to fully settle (multiple hops allowed) ---
+            # --- Step 4: wait for page to fully settle ---
             try:
                 await page.wait_for_load_state("networkidle", timeout=20_000)
             except Exception:
                 pass
 
-            # Dismiss cookie banner on destination page too
             await _dismiss_cookie_banner()
-            await _asyncio.sleep(1)
+            await asyncio.sleep(1)
 
             current_url = page.url
             logger.info("Camoufox: approval page → %s", current_url)
 
-            # --- Step 5: advance through any remaining consent screens until the
-            # final device approval page is reached. Continue on login.tidal.com is
-            # an intermediate step and must not be treated as completion.
+            # --- Step 5: advance through consent screens to final approval ---
             async def _click_first_match(texts: list[str]) -> Optional[str]:
                 for button_text in texts:
                     exact_targets = [
@@ -975,311 +776,48 @@ async def _auto_approve_device_link(verify_url: str, email: str, password: str) 
                 except Exception:
                     logger.warning("Camoufox: no approval button found. URL: %s", current_url)
 
-            await _asyncio.sleep(2)
+            await asyncio.sleep(2)
             logger.info("Camoufox: browser closed for %s", email)
             return clicked
 
-    except ImportError:
-        logger.info("camoufox not installed — falling back to patchright")
     except Exception as exc:
-        logger.warning("Camoufox failed (%s) — falling back to patchright", exc)
-
-    # ---- Fallback: patchright (non-headless, needs Xvfb on Linux) ----
-    try:
-        from patchright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
-    except ImportError:
-        logger.warning("Neither camoufox nor patchright installed — cannot auto-approve")
-        return False
-
-    import os as _os
-    import random as _random
-
-    fp_binary = _os.environ.get("FINGERPRINT_CHROMIUM_PATH", "")
-    using_fp_chrome = fp_binary and _os.path.isfile(fp_binary)
-    fp_seed = _random.randint(1000, 99999)
-
-    launch_args = [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--window-position=-32000,-32000",
-        "--window-size=1280,800",
-    ]
-    if using_fp_chrome:
-        launch_args += [
-            f"--fingerprint={fp_seed}",
-            "--fingerprint-platform=windows",
-            "--fingerprint-brand=Chrome",
-            "--fingerprint-brand-version=136",
-        ]
-        logger.info("Patchright fallback: using fingerprint-chromium binary (seed=%d)", fp_seed)
-    else:
-        logger.info("Patchright fallback: using bundled Chromium")
-
-    launch_kwargs: dict = dict(
-        headless=False,
-        args=launch_args,
-    )
-    if using_fp_chrome:
-        launch_kwargs["executable_path"] = fp_binary
-
-    logger.info("Patchright: starting browser to approve device link %s", full_url)
-    try:
-        async with async_playwright() as pw:
-            browser = await pw.chromium.launch(**launch_kwargs)
-            ctx = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/136.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1280, "height": 800},
-            )
-            page = await ctx.new_page()
-            await page.goto(full_url, timeout=30_000, wait_until="domcontentloaded")
-            await asyncio.sleep(3)
-
-            try:
-                email_state = await _submit_email_stage(page, "Patchright")
-            except PlaywrightTimeout:
-                logger.warning("Patchright: email field not found (DataDome blocked)")
-                await browser.close()
-                return False
-            except Exception as exc:
-                logger.warning("Patchright: email step failed (%s)", exc)
-                await browser.close()
-                return False
-
-            if email_state == "invalid_credentials":
-                _oxaam_invalid_tidal_emails.add(email)
-                logger.warning("Patchright: Tidal rejected Oxaam credentials for %s", email)
-                await browser.close()
-                return False
-            if email_state == "stuck":
-                await browser.close()
-                return False
-
-            if email_state == "password":
-                try:
-                    await page.locator("#password, input[type='password']").first.fill(password)
-                    await page.locator("button:has-text('Log In')").first.click()
-                    await asyncio.sleep(4)
-                    logger.info("Patchright: password submitted")
-                except PlaywrightTimeout:
-                    logger.warning("Patchright: password field not found")
-                    await browser.close()
-                    return False
-            else:
-                logger.info(
-                    "Patchright: password step skipped after email submit (state=%s, url=%s)",
-                    email_state,
-                    page.url,
-                )
-
-            # --- Step 3: wait for redirect away from login.tidal.com ---
-            async def _patchright_dismiss_cookie():
-                try:
-                    reject = page.locator("button:has-text('Reject'), button:has-text('Decline')")
-                    if await reject.count() > 0:
-                        for ct in ("Accept", "ACCEPT", "OK", "Got it", "Accept all"):
-                            loc = page.locator(f"button:has-text('{ct}')")
-                            if await loc.count() > 0:
-                                await loc.first.click()
-                                logger.info("Patchright: dismissed cookie banner ('%s')", ct)
-                                return True
-                except Exception:
-                    pass
-                return False
-
-            async def _patchright_has_invalid_login_message() -> bool:
-                body_text = await _read_body_text(page)
-                return "username or password is incorrect" in body_text.lower()
-
-            redirected = False
-            for _round in range(3):
-                try:
-                    await page.wait_for_function(
-                        "() => !window.location.href.includes('login.tidal.com')",
-                        timeout=10_000,
-                    )
-                    redirected = True
-                    break
-                except PlaywrightTimeout:
-                    await _patchright_dismiss_cookie()
-                    if await _patchright_has_invalid_login_message():
-                        _oxaam_invalid_tidal_emails.add(email)
-                        logger.warning("Patchright: Tidal rejected Oxaam credentials for %s", email)
-                        await browser.close()
-                        return False
-                    await asyncio.sleep(1)
-
-            logger.info("Patchright: post-login page → %s (redirected=%s)", page.url, redirected)
-
-            if not redirected and await _patchright_has_invalid_login_message():
-                _oxaam_invalid_tidal_emails.add(email)
-                logger.warning("Patchright: Tidal rejected Oxaam credentials for %s", email)
-                await browser.close()
-                return False
-
-            try:
-                await page.wait_for_load_state("networkidle", timeout=15_000)
-            except PlaywrightTimeout:
-                pass
-
-            # Dismiss cookie banner on destination page
-            await _patchright_dismiss_cookie()
-            await asyncio.sleep(1)
-
-            logger.info("Patchright: approval page → %s", page.url)
-
-            async def _patchright_click_first_match(texts: list[str]) -> Optional[str]:
-                for button_text in texts:
-                    exact_targets = [
-                        page.locator("button"),
-                        page.locator("a"),
-                        page.locator("[role='button']"),
-                    ]
-                    for target in exact_targets:
-                        try:
-                            count = await target.count()
-                            for idx in range(min(count, 12)):
-                                candidate = target.nth(idx)
-                                raw_text = await candidate.inner_text()
-                                normalized = " ".join(raw_text.split())
-                                if normalized.lower() == button_text.lower():
-                                    await candidate.scroll_into_view_if_needed(timeout=2_000)
-                                    await candidate.click(force=True, timeout=5_000)
-                                    return button_text
-                        except Exception:
-                            continue
-
-                    locators = [
-                        page.get_by_role("button", name=button_text, exact=False),
-                        page.get_by_role("link", name=button_text, exact=False),
-                        page.get_by_text(button_text, exact=False),
-                        page.locator(f"button:has-text('{button_text}')"),
-                        page.locator(f"a:has-text('{button_text}')"),
-                        page.locator(f"[role='button']:has-text('{button_text}')"),
-                    ]
-                    for loc in locators:
-                        try:
-                            if await loc.count() > 0:
-                                await loc.first.scroll_into_view_if_needed(timeout=2_000)
-                                await loc.first.click(force=True, timeout=5_000)
-                                return button_text
-                        except Exception:
-                            continue
-                return None
-
-            clicked = False
-            for _step in range(3):
-                current_url = page.url
-                if "login.tidal.com" in current_url:
-                    if await _patchright_has_invalid_login_message():
-                        _oxaam_invalid_tidal_emails.add(email)
-                        logger.warning("Patchright: Tidal rejected Oxaam credentials for %s", email)
-                        await browser.close()
-                        return False
-                    intermediate = await _patchright_click_first_match([
-                        "Continue", "CONTINUE", "Allow", "ALLOW", "Authorize", "Confirm", "OK",
-                    ])
-                    if intermediate:
-                        logger.info(
-                            "Patchright: clicked intermediate consent button '%s' on %s",
-                            intermediate,
-                            current_url,
-                        )
-                        try:
-                            await page.wait_for_function(
-                                "() => !window.location.href.includes('login.tidal.com')",
-                                timeout=15_000,
-                            )
-                            logger.info("Patchright: advanced beyond login → %s", page.url)
-                        except PlaywrightTimeout:
-                            try:
-                                await page.wait_for_load_state("networkidle", timeout=10_000)
-                            except PlaywrightTimeout:
-                                pass
-                            await _patchright_dismiss_cookie()
-                            if await _patchright_has_invalid_login_message():
-                                _oxaam_invalid_tidal_emails.add(email)
-                                logger.warning("Patchright: Tidal rejected Oxaam credentials for %s", email)
-                                await browser.close()
-                                return False
-                        continue
-
-                final_button = await _patchright_click_first_match([
-                    "Allow", "ALLOW", "Approve", "APPROVE",
-                    "Authorize", "Yes, allow", "Grant access",
-                    "Allow access", "Link device", "Continue", "CONTINUE",
-                    "OK", "Confirm",
-                ])
-                if final_button:
-                    logger.info("Patchright: clicked approval button '%s'", final_button)
-                    clicked = True
-                    break
-
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=5_000)
-                except PlaywrightTimeout:
-                    pass
-                await _patchright_dismiss_cookie()
-
-            if not clicked:
-                try:
-                    btns = await page.locator("button").all_text_contents()
-                    logger.warning("Patchright: no approve button found. Visible buttons: %s", btns)
-                except Exception:
-                    logger.warning("Patchright: no approve button found")
-
-            await asyncio.sleep(2)
-            await browser.close()
-            logger.info("Patchright: browser closed for %s", email)
-            return clicked
-
-    except Exception as exc:
-        logger.warning("Patchright auto-approval error: %s", exc)
+        logger.warning("Camoufox auto-approval error for %s: %s", email, exc)
         return False
 
 
 async def _password_login() -> bool:
     """Attempt to refresh auth via device-code flow.
 
-    1. Scrapes Oxaam to get the Tidal account credentials.
+    1. Scrapes Oxaam to get Tidal account credentials from the CREDENTIALS block.
     2. Starts a Tidal device-code authorization.
-    3. Launches a headless Playwright browser to auto-approve the link.
-    4. Falls back to printing the URL for manual approval if Playwright fails.
-    5. Polls for up to 5 minutes for authorization.
-    6. On approval, stores the new refresh_token in TOKEN_FILE.
+    3. Launches Camoufox browser to auto-approve the link.
+    4. Polls for up to 5 minutes for authorization.
+    5. On approval, stores the new refresh_token in TOKEN_FILE.
 
     Returns True if a new token was obtained, False otherwise.
     """
     if not OXAAM_EMAIL or not OXAAM_PASSWORD:
         return False
 
-    # Fetch Tidal credentials from Oxaam (email + password used for auto browser approval)
-    tidal_pass = ""
-    tidal_user = "unknown"
+    # Fetch all Tidal credentials from Oxaam (list of {email, password} dicts)
     try:
-        tidal_user, tidal_pass = await _fetch_oxaam_tidal_creds()
+        creds_list = await _fetch_oxaam_tidal_creds()
     except Exception as e:
         logger.warning("Could not fetch Oxaam creds after 3 retries: %s", e)
         logger.warning("Cannot auto-approve device link without Tidal credentials — aborting login attempt")
         return False
 
+    # Build candidate pool: prefer freshly-fetched pool, filter out known-invalid
     candidate_pool: list[dict] = []
     seen_emails: set[str] = set()
-    for candidate in _oxaam_observed_cred_pool or [{"email": tidal_user, "password": tidal_pass}]:
+    all_candidates = creds_list or _oxaam_observed_cred_pool
+    for candidate in all_candidates:
         email = str(candidate.get("email", "")).strip()
         password = str(candidate.get("password", "")).strip()
         if not email or not password or email in seen_emails or email in _oxaam_invalid_tidal_emails:
             continue
         seen_emails.add(email)
         candidate_pool.append({"email": email, "password": password})
-
-    if not candidate_pool and tidal_user != "unknown" and tidal_pass:
-        candidate_pool.append({"email": tidal_user, "password": tidal_pass})
 
     if not candidate_pool:
         logger.warning("Oxaam did not provide any usable Tidal credential candidates")
