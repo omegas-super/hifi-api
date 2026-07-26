@@ -41,13 +41,6 @@ except ImportError:
     HAS_CURL_CFFI = False
     logger.warning("curl_cffi not installed — Oxaam fast-path disabled, will use Camoufox fallback")
 
-try:
-    from patchright.async_api import async_playwright, TimeoutError as _PatchrightTimeout
-
-    HAS_PATCHRIGHT = True
-except ImportError:
-    HAS_PATCHRIGHT = False
-    logger.warning("Patchright not installed — Tidal auto-approval will use Camoufox fallback")
 
 load_dotenv()
 
@@ -307,10 +300,9 @@ def _random_proxy() -> str | None:
 
 
 def _parse_proxy_for_browser(proxy_url: str) -> dict:
-    """Parse a proxy URL into Camoufox/Patchright-compatible config.
+    """Parse a proxy URL into Camoufox-compatible config.
 
-    Returns a dict with keys suitable for both Camoufox (``proxy`` str)
-    and Patchright (``server``, ``username``, ``password``).
+    Returns a dict with keys suitable for Camoufox (``server``, ``username``, ``password``).
     """
     parsed = urlparse(proxy_url)
     host = parsed.hostname or "localhost"
@@ -1182,8 +1174,12 @@ async def _tidal_http_auto_approve(verify_url: str, email: str, password: str, b
 
 async def _camoufox_full_approve(full_url: str, email: str, password: str,
                                  proxy_url: str | None = None) -> bool:
-    """Auto-approve a Tidal device link inside Camoufox (ported from old
-    Patchright flow — fill, Tab, wait_for_function, Enter fallback)."""
+    """Auto-approve a Tidal device link inside Camoufox.
+
+    Uses the proven form-interaction flow: fill + Tab to trigger Vue.js
+    validation, wait_for_function for submit button enabled, Enter fallback,
+    cookie banner dismissal, and multi-step consent/approval button clicking.
+    """
     if not HAS_CAMOUFOX:
         return False
 
@@ -1191,7 +1187,7 @@ async def _camoufox_full_approve(full_url: str, email: str, password: str,
         proxy_url.split("@")[-1] if "@" in proxy_url else proxy_url
     )
 
-    # ── Helpers (same as old battle-tested Patchright flow) ────────────────
+    # ── Helpers (battle-tested form-interaction flow) ───────────────────────
     async def _body_text(page) -> str:
         try:
             return await page.locator("body").inner_text()
@@ -1498,28 +1494,39 @@ async def _camoufox_full_approve(full_url: str, email: str, password: str,
         return False
 
 
-async def _auto_approve_device_link(verify_url: str, email: str, password: str, browser=None) -> bool:
+async def _auto_approve_device_link(verify_url: str, email: str, password: str) -> bool:
     """Auto-approve a Tidal device link.
 
-    Tries up to 3 rotating proxies with Camoufox, then curl_cffi as last resort.
+    Primary:    Camoufox direct (no proxy) — fastest, works on clean IPs.
+    Fallback:   Camoufox + proxy rotation (up to 3 unique proxies).
+    Last resort: curl_cffi bare HTTP (usually blocked by DataDome).
     """
+    if not HAS_CAMOUFOX:
+        logger.warning("Camoufox not available — falling back to curl_cffi")
+        return await _tidal_http_auto_approve(verify_url, email, password, None)
+
     full_url = verify_url if verify_url.startswith("http") else f"https://{verify_url}"
 
-    # ── Camoufox + proxy rotation ──────────────────────────────────────────
+    # ── Phase 1: Camoufox direct (no proxy) ────────────────────────────
+    logger.info("Camoufox [direct]: → %s", email)
+    if await _camoufox_full_approve(full_url, email, password, proxy_url=None):
+        return True
+
+    # ── Phase 2: Camoufox + proxy rotation (3 unique proxies) ──────────
     tried_proxies: set[str] = set()
     for attempt in range(3):
         proxy_url = _random_proxy()
-        if not proxy_url or not HAS_CAMOUFOX:
-            break
+        if proxy_url is None:
+            break  # no proxies in pool
         proxy_key = proxy_url.split("@")[-1] if "@" in proxy_url else proxy_url
         if proxy_key in tried_proxies:
             continue
         tried_proxies.add(proxy_key)
-        logger.info("Camoufox [%d/3]: %s → %s", attempt + 1, proxy_key, email)
+        logger.info("Camoufox [proxy %d/3]: %s → %s", attempt + 1, proxy_key, email)
         if await _camoufox_full_approve(full_url, email, password, proxy_url=proxy_url):
             return True
 
-    # ── curl_cffi fallback ─────────────────────────────────────────────────
+    # ── Phase 3: curl_cffi bare HTTP (last resort, usually DataDome-blocked)
     logger.info("curl_cffi fallback → %s", email)
     return await _tidal_http_auto_approve(verify_url, email, password, None)
 
@@ -1529,7 +1536,7 @@ async def _password_login() -> bool:
 
     1. Fetch Oxaam Tidal credentials (curl_cffi fast-path, Camoufox fallback).
     2. Start a Tidal device-code authorization for each candidate.
-    3. Auto-approve via Patchright headed Chrome (primary) or Camoufox (fallback).
+    3. Auto-approve via Camoufox browser (proxy rotation → direct → curl_cffi).
     4. Poll for token completion.
     5. Store the new refresh_token in TOKEN_FILE.
     """
@@ -1594,12 +1601,12 @@ async def _password_login() -> bool:
         interval = max(dev_data.get("interval", 5), 2)
 
         logger.info(
-            "Tidal device code obtained — auto-approving via Patchright "
+            "Tidal device code obtained — auto-approving via Camoufox "
             "(candidate %d/%d, account: %s, url: https://%s)",
             attempt_idx, len(candidate_pool), tidal_user, verify_url,
         )
 
-        # Launch auto-approval task (Patchright → curl_cffi → Camoufox)
+        # Launch auto-approval task (Camoufox direct → proxy rotation → curl_cffi)
         approval_task = asyncio.create_task(
             _auto_approve_device_link(verify_url, tidal_user, tidal_pass)
         )
