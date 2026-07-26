@@ -383,7 +383,7 @@ async def _fetch_oxaam_tidal_creds() -> list[dict]:
     loop = asyncio.get_event_loop()
 
     def _scrape() -> list[dict]:
-        with Session(impersonate="chrome131") as session:
+        with Session(impersonate="chrome120") as session:
             # 1. GET the login page to pick up session cookies
             session.get("https://www.oxaam.com/login.php", timeout=20)
 
@@ -565,7 +565,7 @@ async def _auto_approve_device_link(verify_url: str, email: str, password: str) 
         logger.warning("Camoufox not installed — cannot auto-approve device link")
         return False
 
-    logger.info("Camoufox: starting headless Firefox (os=windows, fingerprint injected) for %s", full_url)
+    logger.info("Camoufox: starting headless Firefox (os=windows, fp injected) for %s", full_url)
     try:
         async with AsyncCamoufox(
             headless=True,
@@ -583,36 +583,73 @@ async def _auto_approve_device_link(verify_url: str, email: str, password: str) 
                 pass
             await asyncio.sleep(2)
 
-            # --- Step 1: email ---
+            # --- API-based login (from HAR analysis) ---
+            # Instead of clicking buttons, call login.tidal.com's internal API
+            # endpoints via page.evaluate() — the page already has valid DataDome
+            # cookies from the JS challenge. This is MUCH faster than form-filling.
+            #
+            # HAR flow: POST /api/email → POST /api/email/user/existing → 302 redirect
             try:
-                email_state = await _submit_email_stage(page)
-            except Exception as e:
-                logger.warning("Camoufox: email field not found (%s)", e)
-                return False
+                await page.wait_for_selector("#email, input[type='email'], input[name='email']", timeout=30_000)
+                logger.info("Camoufox: DataDome passed — logging in via API")
 
-            if email_state == "invalid_credentials":
-                _oxaam_invalid_tidal_emails.add(email)
-                logger.warning("Camoufox: Tidal rejected Oxaam credentials for %s", email)
-                return False
-            if email_state == "stuck":
-                logger.error("Camoufox: email step stalled for %s", email)
-                return False
+                api_result = await page.evaluate("""
+                    async (email, password) => {
+                        const qs = window.location.search.substring(1);
 
-            # --- Step 2: password ---
-            if email_state == "password":
+                        // Step A: submit email (required pre-flight)
+                        let resp = await fetch('/api/email?' + qs, {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({email: email})
+                        });
+                        if (!resp.ok) {
+                            return {stage: 'email', ok: false, status: resp.status};
+                        }
+
+                        // Step B: login with email + password
+                        resp = await fetch('/api/email/user/existing?' + qs, {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({email: email, password: password})
+                        });
+                        return {stage: 'login', ok: resp.ok, status: resp.status};
+                    }
+                """, email, password)
+
+                logger.info("Camoufox: API login → stage=%s ok=%s status=%s",
+                    api_result.get('stage'), api_result.get('ok'), api_result.get('status'))
+
+                if not api_result.get('ok'):
+                    status = api_result.get('status', 0)
+                    if status in (401, 403):
+                        _oxaam_invalid_tidal_emails.add(email)
+                        logger.warning("Camoufox: Tidal rejected credentials for %s (status=%d)", email, status)
+                        return False
+                    # Non-auth failure: fall through to button-based fallback
+                    logger.warning("Camoufox: API login returned status=%d — falling back to button login", status)
+                    raise RuntimeError(f"API login status {status}")
+            except Exception as api_exc:
+                # API-based login failed — fall back to button-clicking approach
+                logger.warning("Camoufox: API login failed (%s) — trying button-based fallback", api_exc)
                 try:
-                    await page.locator("#password, input[type='password']").first.fill(password)
-                    await page.locator("button:has-text('Log In')").first.click()
-                    logger.info("Camoufox: password submitted — waiting for redirect")
-                except Exception as e:
-                    logger.warning("Camoufox: password field not found: %s", e)
+                    email_state = await _submit_email_stage(page)
+                    if email_state == "invalid_credentials":
+                        _oxaam_invalid_tidal_emails.add(email)
+                        logger.warning("Camoufox: Tidal rejected Oxaam credentials for %s", email)
+                        return False
+                    if email_state == "stuck":
+                        logger.error("Camoufox: email step stalled for %s", email)
+                        return False
+                    if email_state == "password":
+                        await page.locator("#password, input[type='password']").first.fill(password)
+                        await page.locator("button:has-text('Log In')").first.click()
+                        logger.info("Camoufox: password submitted (fallback)")
+                    else:
+                        logger.info("Camoufox: password skipped (fallback state=%s)", email_state)
+                except Exception as fb_exc:
+                    logger.warning("Camoufox: button fallback also failed: %s", fb_exc)
                     return False
-            else:
-                logger.info(
-                    "Camoufox: password step skipped after email submit (state=%s, url=%s)",
-                    email_state,
-                    page.url,
-                )
 
             # --- Step 3: wait for redirect away from login.tidal.com ---
             async def _dismiss_cookie_banner() -> bool:
