@@ -2,7 +2,7 @@ FROM python:3.13.10-slim
 
 WORKDIR /app
 
-# Firefox runtime + Xvfb for Camoufox virtual display (headless='virtual' on Linux)
+# Firefox + Chromium runtime deps, Xvfb for Camoufox virtual display
 RUN apt-get update && apt-get install -y --no-install-recommends \
     wget unzip ca-certificates curl \
     xvfb \
@@ -18,10 +18,13 @@ COPY requirements.txt .
 RUN pip install --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt && \
     # Camoufox: download patched Firefox binary (v152, Linux)
-    python -m camoufox fetch
+    python -m camoufox fetch && \
+    # Playwright: install Chromium browser + system deps for headless
+    python -m playwright install --with-deps chromium
 
 COPY . .
 
-# Camoufox uses headless='virtual' → auto-spawns Xvfb for WAF bypass
-# fingerprint_preset, os spoofing, geoip, screen/window constraints
+# Camoufox: headless='virtual' auto-spawns Xvfb for WAF bypass
+# Playwright: Chromium headless with --disable-blink-features=AutomationControlled
+# Proxy rotation: direct → proxies for both engines, curl_cffi as last resort
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

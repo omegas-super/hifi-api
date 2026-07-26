@@ -41,6 +41,13 @@ except ImportError:
     HAS_CURL_CFFI = False
     logger.warning("curl_cffi not installed — Oxaam fast-path disabled, will use Camoufox fallback")
 
+try:
+    from playwright.async_api import async_playwright
+
+    HAS_PLAYWRIGHT = True
+except ImportError:
+    HAS_PLAYWRIGHT = False
+    logger.warning("Playwright not installed — will use Camoufox only")
 
 load_dotenv()
 
@@ -1376,113 +1383,104 @@ async def _camoufox_full_approve(full_url: str, email: str, password: str,
                     logger.warning("Camoufox [%s]: email step stalled for %s", label, email)
                     return False
 
-                # ── Step 2: Password ──────────────────────────────────
+                # ── Step 2: Password (only if email step showed the field) ──
                 if email_state == "password":
                     try:
-                        await page.locator("#password, input[type='password']"
-                                          ).first.fill(password)
-                        await page.locator("button:has-text('Log In')").first.click()
+                        await page.locator(
+                            "#password, input[type='password']"
+                        ).first.fill(password)
+                        await page.locator(
+                            "button:has-text('Log In')"
+                        ).first.click()
                         logger.info("Camoufox [%s]: password submitted", label)
                     except Exception as exc:
                         logger.warning("Camoufox [%s]: password step failed: %s", label, exc)
                         return False
                 else:
                     logger.info("Camoufox [%s]: password skipped (state=%s, url=%s)",
-                                label, email_state, page.url)
+                                label, email_state, page.url[:120])
 
-                # ── Step 3: Wait for redirect away from login ─────────
-                redirected = False
-                for _ in range(3):
-                    try:
-                        await page.wait_for_function(
-                            "() => !window.location.href.includes('login.tidal.com')",
-                            timeout=10_000,
-                        )
-                        redirected = True
-                        break
-                    except Exception:
-                        await _dismiss_cookie_banner(page)
-                        if await _has_invalid_login_msg(page):
-                            _oxaam_invalid_tidal_emails.add(email)
-                            logger.warning("Camoufox [%s]: Tidal rejected %s", label, email)
-                            return False
-                        await asyncio.sleep(1)
+                # ── Step 3: Unified consent / approval loop ─────────────
+                # After email (or email+password), the page may be on:
+                #   a) login.tidal.com/authorize — OAuth consent (click Continue/Allow)
+                #   b) offer.tidal.com/device/link — final approval (click Allow/Approve)
+                #   c) Some other intermediate page
+                # This loop handles ALL states instead of the old rigid sequence
+                # that deadlocked when the redirect never fired.
+                CONSENT_BTNS = [
+                    "Continue", "CONTINUE", "Allow", "ALLOW",
+                    "Authorize", "Confirm", "OK", "Yes",
+                    "Agree", "Accept", "ACCEPT",
+                ]
+                APPROVE_BTNS = [
+                    "Allow", "ALLOW", "Approve", "APPROVE",
+                    "Authorize", "Yes, allow", "Grant access",
+                    "Allow access", "Link device", "Continue", "CONTINUE",
+                    "OK", "Confirm", "Accept", "ACCEPT",
+                ]
 
-                if redirected:
-                    logger.info("Camoufox [%s]: redirected away from login → %s",
-                                label, page.url[:100])
-                else:
+                clicked = False
+                for _round in range(8):
+                    current_url = page.url
+                    btns = await _visible_button_texts(page)
+                    logger.info("Camoufox [%s]: round %d — URL: %s  buttons: %s",
+                                label, _round + 1,
+                                current_url[:120], btns[:8] if btns else "(none)")
+
+                    # Always dismiss cookie banners first
+                    await _dismiss_cookie_banner(page)
+
+                    # Check for invalid login (wrong password / rejected email)
                     if await _has_invalid_login_msg(page):
                         _oxaam_invalid_tidal_emails.add(email)
                         logger.warning("Camoufox [%s]: Tidal rejected %s", label, email)
                         return False
-                    logger.warning("Camoufox [%s]: still on login page — URL: %s",
-                                   label, page.url[:100])
 
-                # ── Step 4: Wait for page to settle ───────────────────
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=20_000)
-                except Exception:
-                    pass
-                await _dismiss_cookie_banner(page)
-                await asyncio.sleep(1)
-
-                logger.info("Camoufox [%s]: approval page → %s", label, page.url[:100])
-
-                # ── Step 5: Click consent / approval buttons ──────────
-                clicked = False
-                for _step in range(3):
-                    current_url = page.url
                     if "login.tidal.com" in current_url:
-                        if await _has_invalid_login_msg(page):
-                            _oxaam_invalid_tidal_emails.add(email)
-                            logger.warning("Camoufox [%s]: Tidal rejected %s", label, email)
-                            return False
-                        intermediate = await _click_first_match(page, [
-                            "Continue", "CONTINUE", "Allow", "ALLOW",
-                            "Authorize", "Confirm", "OK",
-                        ])
-                        if intermediate:
-                            logger.info("Camoufox [%s]: clicked '%s' on login page", label, intermediate)
+                        # On OAuth consent screen — click Continue / Allow
+                        btn = await _click_first_match(page, CONSENT_BTNS)
+                        if btn:
+                            logger.info("Camoufox [%s]: clicked '%s' on consent page", label, btn)
                             try:
                                 await page.wait_for_function(
                                     "() => !window.location.href.includes('login.tidal.com')",
                                     timeout=15_000,
                                 )
+                                logger.info("Camoufox [%s]: left login.tidal.com → %s",
+                                            label, page.url[:100])
                             except Exception:
                                 await page.wait_for_load_state("networkidle", timeout=10_000)
-                            await _dismiss_cookie_banner(page)
-                            if await _has_invalid_login_msg(page):
-                                _oxaam_invalid_tidal_emails.add(email)
-                                return False
                             continue
+                        else:
+                            # No consent button found — page may still be loading
+                            logger.info("Camoufox [%s]: on login page, no consent btn yet", label)
 
-                    final_button = await _click_first_match(page, [
-                        "Allow", "ALLOW", "Approve", "APPROVE",
-                        "Authorize", "Yes, allow", "Grant access",
-                        "Allow access", "Link device", "Continue", "CONTINUE",
-                        "OK", "Confirm",
-                    ])
-                    if final_button:
-                        logger.info("Camoufox [%s]: clicked approval button '%s'", label, final_button)
-                        clicked = True
-                        break
+                    elif "offer.tidal.com" in current_url:
+                        # On device approval page — click Allow / Approve
+                        btn = await _click_first_match(page, APPROVE_BTNS)
+                        if btn:
+                            logger.info("Camoufox [%s]: clicked approval '%s'", label, btn)
+                            clicked = True
+                            break
+                        else:
+                            logger.info("Camoufox [%s]: on offer page, no approve btn yet", label)
+                    else:
+                        logger.info("Camoufox [%s]: unknown page — waiting for navigation", label)
+
+                    # Settle and retry
                     try:
                         await page.wait_for_load_state("networkidle", timeout=5_000)
                     except Exception:
                         pass
-                    await _dismiss_cookie_banner(page)
+                    await asyncio.sleep(1.5)
 
                 if not clicked:
-                    try:
-                        btns = await page.locator("button").all_text_contents()
-                        logger.warning("Camoufox [%s]: no approval btn found. Buttons: %s  URL: %s",
-                                       label, btns, page.url)
-                    except Exception:
-                        logger.warning("Camoufox [%s]: no approval btn found. URL: %s",
-                                       label, page.url)
+                    btns = await _visible_button_texts(page)
+                    logger.warning("Camoufox [%s]: no approval btn after %d rounds. "
+                                   "URL: %s  Buttons: %s",
+                                   label, _round + 1, page.url[:120], btns)
 
-                await asyncio.sleep(2)
+                await asyncio.sleep(1)
                 logger.info("Camoufox [%s]: browser done — clicked=%s for %s",
                             label, clicked, email)
                 return clicked
@@ -1494,39 +1492,380 @@ async def _camoufox_full_approve(full_url: str, email: str, password: str,
         return False
 
 
-async def _auto_approve_device_link(verify_url: str, email: str, password: str) -> bool:
-    """Auto-approve a Tidal device link.
+async def _playwright_auto_approve(full_url: str, email: str, password: str,
+                                   proxy_url: str | None = None) -> bool:
+    """Playwright (Chromium) fallback for Tidal device link approval.
 
-    Primary:    Camoufox direct (no proxy) — fastest, works on clean IPs.
-    Fallback:   Camoufox + proxy rotation (up to 3 unique proxies).
-    Last resort: curl_cffi bare HTTP (usually blocked by DataDome).
+    Uses the same battle-tested form-interaction flow as Camoufox but
+    with Chromium's anti-detection flags for sites that fingerprint Firefox.
     """
-    if not HAS_CAMOUFOX:
-        logger.warning("Camoufox not available — falling back to curl_cffi")
+    if not HAS_PLAYWRIGHT:
+        return False
+
+    label = "direct" if not proxy_url else (
+        proxy_url.split("@")[-1] if "@" in proxy_url else proxy_url
+    )
+
+    # ── Helpers (same pattern as Camoufox) ────────────────────────────────
+    async def _body_text(page) -> str:
+        try:
+            return await page.locator("body").inner_text()
+        except Exception:
+            return ""
+
+    async def _visible_button_texts(page) -> list[str]:
+        try:
+            texts = await page.locator("button").all_text_contents()
+        except Exception:
+            return []
+        return [" ".join(t.split()) for t in texts if t and t.strip()]
+
+    async def _dismiss_cookie_banner(page) -> bool:
+        try:
+            reject = page.locator(
+                "button:has-text('Reject'), button:has-text('REJECT'), "
+                "button:has-text('Decline')"
+            )
+            if await reject.count() > 0:
+                for ct in ("Accept", "ACCEPT", "OK", "Got it", "Accept all"):
+                    loc = page.locator(f"button:has-text('{ct}')")
+                    if await loc.count() > 0:
+                        await loc.first.click()
+                        return True
+        except Exception:
+            pass
+        return False
+
+    async def _click_first_match(page, texts: list[str]) -> str | None:
+        for button_text in texts:
+            for target in [page.locator("button"), page.locator("a"),
+                           page.locator("[role='button']")]:
+                try:
+                    count = await target.count()
+                    for idx in range(min(count, 12)):
+                        candidate = target.nth(idx)
+                        raw = await candidate.inner_text()
+                        if " ".join(raw.split()).lower() == button_text.lower():
+                            await candidate.scroll_into_view_if_needed(timeout=2_000)
+                            await candidate.click(force=True, timeout=5_000)
+                            return button_text
+                except Exception:
+                    continue
+            for loc in [
+                page.get_by_role("button", name=button_text, exact=False),
+                page.get_by_role("link", name=button_text, exact=False),
+                page.get_by_text(button_text, exact=False),
+                page.locator(f"button:has-text('{button_text}')"),
+                page.locator(f"a:has-text('{button_text}')"),
+                page.locator(f"[role='button']:has-text('{button_text}')"),
+            ]:
+                try:
+                    if await loc.count() > 0:
+                        await loc.first.scroll_into_view_if_needed(timeout=2_000)
+                        await loc.first.click(force=True, timeout=5_000)
+                        return button_text
+                except Exception:
+                    continue
+        return None
+
+    async def _has_invalid_login_msg(page) -> bool:
+        return "username or password is incorrect" in (await _body_text(page)).lower()
+
+    # ── Email stage ───────────────────────────────────────────────────────
+    async def _submit_email_stage(page) -> str:
+        await page.wait_for_selector("#email", timeout=30_000)
+        logger.info("Playwright [%s]: DataDome passed — login page loaded", label)
+
+        email_input = page.locator("#email")
+        await email_input.fill(email)
+        try:
+            await email_input.press("Tab")
+        except Exception:
+            pass
+
+        try:
+            await page.wait_for_function(
+                """() => {
+                    const btn = document.querySelector("button[type='submit']");
+                    return !!btn && !btn.disabled;
+                }""",
+                timeout=10_000,
+            )
+        except Exception:
+            pass
+
+        submit_button = page.locator("button[type='submit']").first
+        try:
+            await submit_button.click(timeout=5_000)
+        except Exception:
+            try:
+                await email_input.press("Enter")
+            except Exception:
+                await submit_button.click(force=True, timeout=5_000)
+
+        for attempt in range(20):
+            password_field = page.locator("#password, input[type='password']")
+            try:
+                if await password_field.count() > 0 and await password_field.first.is_visible():
+                    return "password"
+            except Exception:
+                if await password_field.count() > 0:
+                    return "password"
+
+            body_text = (await _body_text(page)).lower()
+            if "username or password is incorrect" in body_text:
+                return "invalid_credentials"
+            if "login.tidal.com" not in page.url:
+                return "redirected"
+
+            try:
+                email_visible = await email_input.is_visible()
+            except Exception:
+                email_visible = False
+            if not email_visible:
+                buttons = [t.lower() for t in await _visible_button_texts(page)]
+                if any("sign up" in t for t in buttons) and not any(
+                    kw in t for t in buttons
+                    for kw in ("continue", "allow", "authorize", "log in")
+                ):
+                    return "invalid_credentials"
+                return "advanced"
+
+            if attempt == 5:
+                with suppress(Exception):
+                    await email_input.press("Enter")
+            await asyncio.sleep(1)
+
+        btns = await _visible_button_texts(page)
+        logger.warning("Playwright [%s]: email step stalled for %s. URL: %s  Buttons: %s",
+                       label, email, page.url, btns)
+        return "stuck"
+
+    # ── Main flow ──────────────────────────────────────────────────────────
+    try:
+        async with async_playwright() as pw:
+            launch_kwargs: dict = {
+                "headless": True,
+                "args": [
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            }
+            if proxy_url:
+                proxy_cfg = _parse_proxy_for_browser(proxy_url)
+                launch_kwargs["proxy"] = {
+                    "server": proxy_cfg["server"],
+                    "username": proxy_cfg.get("username") or None,
+                    "password": proxy_cfg.get("password") or None,
+                }
+
+            browser = await pw.chromium.launch(**launch_kwargs)
+            context = await browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/136.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1440, "height": 900},
+            )
+            page = await context.new_page()
+            # Strip webdriver detection
+            await page.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+            )
+
+            try:
+                await page.goto(full_url, timeout=30_000, wait_until="domcontentloaded")
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=15_000)
+                except Exception:
+                    pass
+                await asyncio.sleep(2)
+
+                # ── If on device page, logout for fresh login ──────────
+                if "offer.tidal.com/device/" in page.url:
+                    logger.info("Playwright [%s]: existing session — logging out", label)
+                    await page.goto("https://login.tidal.com/logout",
+                                    timeout=15_000, wait_until="domcontentloaded")
+                    await asyncio.sleep(1.5)
+                    await page.goto(full_url, timeout=30_000, wait_until="domcontentloaded")
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=15_000)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(2)
+
+                # ── Step 1: Email ─────────────────────────────────────
+                try:
+                    email_state = await _submit_email_stage(page)
+                except Exception as exc:
+                    logger.warning("Playwright [%s]: email step failed: %s", label, exc)
+                    return False
+
+                if email_state == "invalid_credentials":
+                    _oxaam_invalid_tidal_emails.add(email)
+                    logger.warning("Playwright [%s]: Tidal rejected %s", label, email)
+                    return False
+                if email_state == "stuck":
+                    logger.warning("Playwright [%s]: email step stalled for %s", label, email)
+                    return False
+
+                # ── Step 2: Password ──────────────────────────────────
+                if email_state == "password":
+                    try:
+                        await page.locator(
+                            "#password, input[type='password']"
+                        ).first.fill(password)
+                        await page.locator(
+                            "button:has-text('Log In')"
+                        ).first.click()
+                        logger.info("Playwright [%s]: password submitted", label)
+                    except Exception as exc:
+                        logger.warning("Playwright [%s]: password step failed: %s", label, exc)
+                        return False
+                else:
+                    logger.info("Playwright [%s]: password skipped (state=%s, url=%s)",
+                                label, email_state, page.url[:120])
+
+                # ── Step 3: Unified consent / approval loop ────────────
+                CONSENT_BTNS = [
+                    "Continue", "CONTINUE", "Allow", "ALLOW",
+                    "Authorize", "Confirm", "OK", "Yes",
+                    "Agree", "Accept", "ACCEPT",
+                ]
+                APPROVE_BTNS = [
+                    "Allow", "ALLOW", "Approve", "APPROVE",
+                    "Authorize", "Yes, allow", "Grant access",
+                    "Allow access", "Link device", "Continue", "CONTINUE",
+                    "OK", "Confirm", "Accept", "ACCEPT",
+                ]
+
+                clicked = False
+                for _round in range(8):
+                    current_url = page.url
+                    btns = await _visible_button_texts(page)
+                    logger.info("Playwright [%s]: round %d — URL: %s  buttons: %s",
+                                label, _round + 1,
+                                current_url[:120], btns[:8] if btns else "(none)")
+
+                    await _dismiss_cookie_banner(page)
+
+                    if await _has_invalid_login_msg(page):
+                        _oxaam_invalid_tidal_emails.add(email)
+                        logger.warning("Playwright [%s]: Tidal rejected %s", label, email)
+                        return False
+
+                    if "login.tidal.com" in current_url:
+                        btn = await _click_first_match(page, CONSENT_BTNS)
+                        if btn:
+                            logger.info("Playwright [%s]: clicked '%s' on consent page", label, btn)
+                            try:
+                                await page.wait_for_function(
+                                    "() => !window.location.href.includes('login.tidal.com')",
+                                    timeout=15_000,
+                                )
+                                logger.info("Playwright [%s]: left login.tidal.com → %s",
+                                            label, page.url[:100])
+                            except Exception:
+                                await page.wait_for_load_state("networkidle", timeout=10_000)
+                            continue
+                        else:
+                            logger.info("Playwright [%s]: on login page, no consent btn yet", label)
+
+                    elif "offer.tidal.com" in current_url:
+                        btn = await _click_first_match(page, APPROVE_BTNS)
+                        if btn:
+                            logger.info("Playwright [%s]: clicked approval '%s'", label, btn)
+                            clicked = True
+                            break
+                        else:
+                            logger.info("Playwright [%s]: on offer page, no approve btn yet", label)
+                    else:
+                        logger.info("Playwright [%s]: unknown page — waiting", label)
+
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=5_000)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(1.5)
+
+                if not clicked:
+                    btns = await _visible_button_texts(page)
+                    logger.warning("Playwright [%s]: no approval btn after %d rounds. "
+                                   "URL: %s  Buttons: %s",
+                                   label, _round + 1, page.url[:120], btns)
+
+                await asyncio.sleep(1)
+                logger.info("Playwright [%s]: browser done — clicked=%s for %s",
+                            label, clicked, email)
+                return clicked
+
+            finally:
+                await context.close()
+                await browser.close()
+    except Exception as exc:
+        logger.warning("Playwright [%s]: approve failed for %s: %s", label, email, exc)
+        return False
+
+
+async def _auto_approve_device_link(verify_url: str, email: str, password: str) -> bool:
+    """Auto-approve a Tidal device link using ALL available browser engines.
+
+    Phase 1: Camoufox direct → Phase 2: Camoufox + proxies (x3)
+    Phase 3: Playwright direct → Phase 4: Playwright + proxies (x3)
+    Phase 5: curl_cffi bare HTTP (last resort, usually blocked by DataDome).
+    """
+    if not HAS_CAMOUFOX and not HAS_PLAYWRIGHT:
+        logger.warning("No browser engine available — falling back to curl_cffi")
         return await _tidal_http_auto_approve(verify_url, email, password, None)
 
     full_url = verify_url if verify_url.startswith("http") else f"https://{verify_url}"
 
     # ── Phase 1: Camoufox direct (no proxy) ────────────────────────────
-    logger.info("Camoufox [direct]: → %s", email)
-    if await _camoufox_full_approve(full_url, email, password, proxy_url=None):
-        return True
+    if HAS_CAMOUFOX:
+        logger.info("Camoufox [direct]: → %s", email)
+        if await _camoufox_full_approve(full_url, email, password, proxy_url=None):
+            return True
 
     # ── Phase 2: Camoufox + proxy rotation (3 unique proxies) ──────────
     tried_proxies: set[str] = set()
-    for attempt in range(3):
-        proxy_url = _random_proxy()
-        if proxy_url is None:
-            break  # no proxies in pool
-        proxy_key = proxy_url.split("@")[-1] if "@" in proxy_url else proxy_url
-        if proxy_key in tried_proxies:
-            continue
-        tried_proxies.add(proxy_key)
-        logger.info("Camoufox [proxy %d/3]: %s → %s", attempt + 1, proxy_key, email)
-        if await _camoufox_full_approve(full_url, email, password, proxy_url=proxy_url):
+    if HAS_CAMOUFOX:
+        for attempt in range(3):
+            proxy_url = _random_proxy()
+            if proxy_url is None:
+                break  # no proxies in pool
+            proxy_key = proxy_url.split("@")[-1] if "@" in proxy_url else proxy_url
+            if proxy_key in tried_proxies:
+                continue
+            tried_proxies.add(proxy_key)
+            logger.info("Camoufox [proxy %d/3]: %s → %s", attempt + 1, proxy_key, email)
+            if await _camoufox_full_approve(full_url, email, password, proxy_url=proxy_url):
+                return True
+
+    # ── Phase 3: Playwright direct (no proxy) ──────────────────────────
+    if HAS_PLAYWRIGHT:
+        logger.info("Playwright [direct]: → %s", email)
+        if await _playwright_auto_approve(full_url, email, password, proxy_url=None):
             return True
 
-    # ── Phase 3: curl_cffi bare HTTP (last resort, usually DataDome-blocked)
+    # ── Phase 4: Playwright + proxy rotation (3 unique proxies) ────────
+    if HAS_PLAYWRIGHT:
+        for attempt in range(3):
+            proxy_url = _random_proxy()
+            if proxy_url is None:
+                break  # no proxies in pool
+            proxy_key = proxy_url.split("@")[-1] if "@" in proxy_url else proxy_url
+            if proxy_key in tried_proxies:
+                continue
+            tried_proxies.add(proxy_key)
+            logger.info("Playwright [proxy %d/3]: %s → %s", attempt + 1, proxy_key, email)
+            if await _playwright_auto_approve(full_url, email, password, proxy_url=proxy_url):
+                return True
+
+    # ── Phase 5: curl_cffi bare HTTP (last resort, usually DataDome-blocked)
     logger.info("curl_cffi fallback → %s", email)
     return await _tidal_http_auto_approve(verify_url, email, password, None)
 
@@ -1536,7 +1875,7 @@ async def _password_login() -> bool:
 
     1. Fetch Oxaam Tidal credentials (curl_cffi fast-path, Camoufox fallback).
     2. Start a Tidal device-code authorization for each candidate.
-    3. Auto-approve via Camoufox browser (proxy rotation → direct → curl_cffi).
+    3. Auto-approve via Camoufox → Playwright → proxy rotation → curl_cffi.
     4. Poll for token completion.
     5. Store the new refresh_token in TOKEN_FILE.
     """
@@ -1606,7 +1945,7 @@ async def _password_login() -> bool:
             attempt_idx, len(candidate_pool), tidal_user, verify_url,
         )
 
-        # Launch auto-approval task (Camoufox direct → proxy rotation → curl_cffi)
+        # Launch auto-approval task (Camoufox → Playwright → proxies → curl_cffi)
         approval_task = asyncio.create_task(
             _auto_approve_device_link(verify_url, tidal_user, tidal_pass)
         )
