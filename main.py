@@ -1055,203 +1055,129 @@ async def _scrape_oxaam_with_browser(browser, _json) -> list[dict]:
                 await page.close()
 
 
-async def _tidal_http_auto_approve(verify_url: str, email: str, password: str, browser=None) -> bool:
-    """Auto-approve a Tidal device link using pure HTTP (curl_cffi).
+async def _tidal_http_auto_approve(verify_url: str, email: str, password: str, browser=None) -> str:
+    """Fast HTTP-only Tidal device approval via curl_cffi (PRIMARY method).
 
-    Replicates the exact API payloads from ``offer.tidal.com.har``.
-    When ``browser`` is a running Camoufox instance, DataDome cookies are
-    extracted from the browser context and injected into curl_cffi requests,
-    giving us browser-grade WAF bypass with HTTP speed.
+    Replicates the exact flow from offer.tidal.com.har:
+      1. Follow redirect chain: link.tidal.com → offer.tidal.com → login.tidal.com
+      2. POST /api/email (check email)
+      3. POST /api/email/user/existing (login with password)
+      4. GET /login/success → exchange auth code for session
+      5. POST /api/device/link (approve device)
 
-    Returns True if the device link was successfully submitted.
+    Uses Camoufox ONLY for DataDome cookie extraction (2s visit), then
+    does all actual work via curl_cffi at HTTP speed.
+
+    Returns "success", "wrong_password", "no_account", "blocked", or "error".
     """
     if not HAS_CURL_CFFI:
-        logger.warning("HTTP auto-approve: curl_cffi not available")
-        return False
+        return "error"
 
-    # Extract device code from verify_url (e.g. "link.tidal.com/ABUYN" → "ABUYN")
+    # Extract short device code from verify_url (e.g. "link.tidal.com/ABUYN" → "ABUYN")
     device_code = verify_url.rstrip("/").rsplit("/", 1)[-1]
     full_url = verify_url if verify_url.startswith("http") else f"https://{verify_url}"
-    logger.info("HTTP auto-approve: starting for %s (device_code=%s)", email, device_code)
+    logger.info("HTTP [%s]: starting (code=%s)", email, device_code)
 
-    # ── Extract DataDome cookies from Camoufox (browser-grade bypass) ──
-    injected_cookies: dict[str, str] = {}
-    if browser is not None:
+    # ── Step 0: Get DataDome cookies from Camoufox (fast 2s visit) ──
+    dd_cookies: dict[str, str] = {}
+    if HAS_CAMOUFOX and browser is None:
         try:
-            page = await browser.new_page()
-            await page.goto(full_url, timeout=30_000, wait_until="domcontentloaded")
-            try:
-                await page.wait_for_load_state("networkidle", timeout=15_000)
-            except Exception:
-                pass
-            await asyncio.sleep(1.5)
-
-            # Check if DataDome passed — look for the login form
-            login_detected = False
-            _CONTINUE_WORDS = ["continue", "continuar", "continuer", "weiter", "avanti",
-                               "volgen", "dalej", "dalje", "devam", "proceeder"]
-            for sel in ("input[placeholder*='email' i]", "input[placeholder*='username' i]",
-                        "input[name='email']", "input[type='email']", "#email"):
+            from camoufox.async_api import AsyncCamoufox
+            kw = _camoufox_kwargs(fingerprint_preset=True,
+                webgl_config=_VALID_WEBGL_CONFIGS.get("linux" if _IS_LINUX else "windows"))
+            async with AsyncCamoufox(**kw) as cam:
+                pg = await cam.new_page()
+                await pg.goto(full_url, timeout=30_000, wait_until="domcontentloaded")
                 try:
-                    if await page.locator(sel).count() > 0:
-                        login_detected = True
-                        break
+                    await pg.wait_for_load_state("networkidle", timeout=10_000)
                 except Exception:
                     pass
-            if not login_detected:
-                # Also detect by button text in any language
-                try:
-                    all_btns = await page.locator("button").all_text_contents()
-                    for btn_text in all_btns:
-                        if btn_text.strip().lower() in _CONTINUE_WORDS:
-                            login_detected = True
-                            break
-                except Exception:
-                    pass
-            # Also check heading text
-            if not login_detected:
-                try:
-                    body_text = await page.locator("body").inner_text()
-                    login_detected = "sign up or log in" in body_text.lower() or "log in" in body_text.lower()
-                except Exception:
-                    pass
-
-            if not login_detected:
-                logger.warning("HTTP auto-approve: DataDome blocked in browser — cannot extract cookies")
-                await page.close()
-                return False
-
-            # Extract all cookies from browser context
-            browser_cookies = await page.context.cookies()
-            for c in browser_cookies:
-                injected_cookies[c["name"]] = c["value"]
-
-            logger.info(
-                "HTTP auto-approve: extracted %d cookies from Camoufox (datadome=%s, dd=%s)",
-                len(browser_cookies),
-                bool(injected_cookies.get("datadome")),
-                bool(injected_cookies.get("dd")),
-            )
-
-            # Get the final authorize URL from the browser
-            browser_final_url = page.url
-            await page.close()
-        except Exception as exc:
-            logger.warning("HTTP auto-approve: cookie extraction failed: %s", exc)
-            injected_cookies = {}
-            browser_final_url = None
-    else:
-        browser_final_url = None
+                await asyncio.sleep(2)
+                for c in await pg.context.cookies():
+                    dd_cookies[c["name"]] = c["value"]
+                await pg.close()
+            logger.info("HTTP [%s]: got %d DataDome cookies from Camoufox", email, len(dd_cookies))
+        except Exception as e:
+            logger.info("HTTP [%s]: Camoufox cookie extraction failed: %s", email, e)
 
     try:
         async with _CurlSession(impersonate="safari17_0") as session:
-            # 1. Follow redirect chain to get cookies + authorize URL
-            if injected_cookies:
-                # Use browser-extracted cookies directly
-                cookie_header = "; ".join(
-                    f"{k}={v}" for k, v in injected_cookies.items()
-                )
-                session.headers.update({"Cookie": cookie_header})
-                final_url = browser_final_url or full_url
-                logger.info("HTTP auto-approve: using %d browser-extracted cookies", len(injected_cookies))
-            else:
-                # No browser — try bare curl_cffi (may hit DataDome)
-                logger.info("HTTP auto-approve: no browser cookies, trying bare curl_cffi...")
-                resp = await session.get(
-                    full_url,
-                    timeout=15,
-                    allow_redirects=True,
-                )
-                final_url = str(resp.url)
+            # Inject DataDome cookies if we have them
+            if dd_cookies:
+                session.headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in dd_cookies.items())
 
-            logger.info("HTTP auto-approve: final authorize URL: %s", final_url[:150] if final_url else "?")
+            # ── Step 1: Follow redirect chain to login.tidal.com ──
+            resp = await session.get(full_url, timeout=15, allow_redirects=True)
+            final_url = str(resp.url)
+            logger.info("HTTP [%s]: redirect chain → %s", email, final_url[:120])
 
-            # Extract query string
+            # Extract query string from the authorize URL
             qs = ""
-            if final_url and "?" in final_url:
+            if "?" in final_url:
                 qs = final_url.split("?", 1)[1]
 
-            if not final_url or "login.tidal.com" not in final_url or not qs:
-                logger.warning("HTTP auto-approve: unexpected redirect target: %s", (final_url or "?")[:150])
-                return False
+            if "login.tidal.com" not in final_url or not qs:
+                logger.warning("HTTP [%s]: unexpected redirect: %s", email, final_url[:120])
+                return "blocked"
 
-            # 2. POST /api/email — check if email exists
-            email_payload = {"email": email}
-            logger.info("HTTP auto-approve: POST /api/email for %s (qs=%s)", email, qs[:80])
-            email_check = await session.post(
+            # ── Step 2: POST /api/email ──
+            email_resp = await session.post(
                 f"https://login.tidal.com/api/email?{qs}",
-                json=email_payload,
-                headers={
-                    "Accept": "application/json, text/plain, */*",
-                    "Origin": "https://login.tidal.com",
-                    "Referer": final_url,
-                },
+                json={"email": email},
+                headers={"Accept": "application/json", "Origin": "https://login.tidal.com", "Referer": final_url},
                 timeout=15,
             )
-            logger.info("HTTP auto-approve: /api/email → %d body=%s", email_check.status_code, email_check.text[:500])
-            if email_check.status_code != 200:
-                logger.warning("HTTP auto-approve: /api/email returned %d for %s", email_check.status_code, email)
-                return False
+            logger.info("HTTP [%s]: /api/email → %d %s", email, email_resp.status_code, email_resp.text[:200])
+            if email_resp.status_code != 200:
+                return "blocked"
 
-            # 3. POST /api/email/user/existing — login with password
-            login_payload = {"email": email, "password": password}
-            logger.info("HTTP auto-approve: POST /api/email/user/existing for %s", email)
+            # ── Step 3: POST /api/email/user/existing ──
             login_resp = await session.post(
                 f"https://login.tidal.com/api/email/user/existing?{qs}",
-                json=login_payload,
-                headers={
-                    "Accept": "application/json, text/plain, */*",
-                    "Origin": "https://login.tidal.com",
-                    "Referer": final_url,
-                },
+                json={"email": email, "password": password},
+                headers={"Accept": "application/json", "Origin": "https://login.tidal.com", "Referer": final_url},
                 timeout=15,
                 allow_redirects=True,
             )
-            logger.info("HTTP auto-approve: /api/email/user/existing → %d body=%s", login_resp.status_code, login_resp.text[:500])
+            logger.info("HTTP [%s]: /api/email/user/existing → %d %s", email, login_resp.status_code, login_resp.text[:200])
+
+            if login_resp.status_code in (401, 403):
+                _oxaam_invalid_tidal_emails.add(email)
+                return "wrong_password"
             if login_resp.status_code not in (200, 302):
-                if login_resp.status_code in (401, 403):
-                    _oxaam_invalid_tidal_emails.add(email)
-                    logger.warning("HTTP auto-approve: Tidal rejected %s (status=%d)", email, login_resp.status_code)
-                else:
-                    logger.warning("HTTP auto-approve: login returned %d for %s", login_resp.status_code, email)
-                return False
+                return "error"
 
-            logger.info("HTTP auto-approve: login OK for %s, post-login URL: %s", email, str(login_resp.url)[:120])
-
-            # 4. Follow /success → offer.tidal.com redirect chain
+            # ── Step 4: GET /login/success → exchange code for session ──
             success_resp = await session.get(
                 "https://login.tidal.com/success",
-                timeout=15,
-                allow_redirects=True,
+                timeout=15, allow_redirects=True,
             )
-            logger.info("HTTP auto-approve: post-login redirect chain → %s (status=%d)", str(success_resp.url)[:120], success_resp.status_code)
+            logger.info("HTTP [%s]: /success → %s", email, str(success_resp.url)[:120])
 
-            # 5. POST /api/device/link — approve the device
-            link_payload = {"deviceCode": device_code}
-            logger.info("HTTP auto-approve: POST /api/device/link (deviceCode=%s)", device_code)
+            # ── Step 5: POST /api/device/link ──
             link_resp = await session.post(
                 "https://offer.tidal.com/api/device/link",
-                json=link_payload,
-                headers={
-                    "Accept": "application/json, text/plain, */*",
-                    "Origin": "https://offer.tidal.com",
-                    "Referer": "https://offer.tidal.com/device/link",
-                },
+                json={"deviceCode": device_code},
+                headers={"Accept": "application/json", "Origin": "https://offer.tidal.com",
+                         "Referer": "https://offer.tidal.com/device/link"},
                 timeout=15,
             )
-            logger.info("HTTP auto-approve: /api/device/link → %d body=%s", link_resp.status_code, link_resp.text[:500])
+            logger.info("HTTP [%s]: /api/device/link → %d %s", email, link_resp.status_code, link_resp.text[:300])
 
             if link_resp.status_code in (200, 201, 204):
-                logger.info("HTTP auto-approve: ✅ device linked successfully for %s", email)
-                return True
+                logger.info("HTTP [%s]: ✅ device linked", email)
+                return "success"
 
-            # Even non-200 might mean the link worked (Tidal sometimes returns 409 for already-linked)
-            logger.info("HTTP auto-approve: /api/device/link returned %d (login succeeded for %s, treating as success)", link_resp.status_code, email)
-            return True
+            # 409 = already linked, treat as success
+            if link_resp.status_code == 409:
+                logger.info("HTTP [%s]: ✅ device already linked (409)", email)
+                return "success"
+
+            return "error"
 
     except Exception as exc:
-        logger.warning("HTTP auto-approve failed for %s: %s", email, exc, exc_info=True)
-        return False
+        logger.warning("HTTP [%s]: failed: %s", email, exc)
+        return "error"
 
 
 async def _camoufox_full_approve(full_url: str, email: str, password: str,
@@ -1620,11 +1546,19 @@ async def _camoufox_full_approve(full_url: str, email: str, password: str,
                         with suppress(Exception):
                             await pass_input.press("Enter")
 
+                    # Wait for URL to change AWAY from login.tidal.com
                     try:
-                        await page.wait_for_load_state("networkidle", timeout=15_000)
+                        await page.wait_for_function(
+                            "() => !window.location.href.includes('login.tidal.com')",
+                            timeout=20_000,
+                        )
                     except Exception:
                         pass
-                    await asyncio.sleep(3)
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=10_000)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(2)
 
                     # Check post-login state
                     post_state = await _detect_page_state(page)
@@ -1689,21 +1623,38 @@ async def _camoufox_full_approve(full_url: str, email: str, password: str,
                             continue
 
                     elif "offer.tidal.com" in cur:
-                        # On /device/link — device code is auto-filled,
-                        # just click Continue with a 2s delay
+                        # On /device/link — enter the device code and click Continue
                         if "/device/link" in cur:
                             if not re_navigated:
-                                logger.info("Camoufox [%s]: on /device/link — waiting 2s then clicking Continue", label)
                                 re_navigated = True
-                                await asyncio.sleep(2)
+                                user_code = full_url.rstrip("/").rsplit("/", 1)[-1]
+                                logger.info("Camoufox [%s]: on /device/link — entering code '%s'", label, user_code)
+                                # Fill the code input
+                                for code_sel in (
+                                    "input[placeholder*='WADIY']",
+                                    "input[placeholder*='code' i]",
+                                    "input[placeholder*='e.g.' i]",
+                                    "input[type='text']",
+                                ):
+                                    try:
+                                        ci = page.locator(code_sel).first
+                                        if await ci.count() > 0 and await ci.is_visible():
+                                            await ci.click()
+                                            await ci.fill("")
+                                            await ci.type(user_code, delay=50)
+                                            logger.info("Camoufox [%s]: entered code '%s' in input", label, user_code)
+                                            await asyncio.sleep(0.5)
+                                            break
+                                    except Exception:
+                                        continue
+                            # Click Continue
                             btn = await _click_first_match(page, APPROVE_BTNS)
                             if btn:
                                 logger.info("Camoufox [%s]: clicked Continue on /device/link ✓", label)
                                 clicked = True
                                 break
                             else:
-                                logger.info("Camoufox [%s]: no Continue btn on /device/link — buttons: %s", label, btns[:6])
-                            # Wait for navigation after click
+                                logger.info("Camoufox [%s]: no Continue btn on /device/link", label)
                             try:
                                 await page.wait_for_load_state("networkidle", timeout=10_000)
                             except Exception:
@@ -2211,40 +2162,32 @@ async def _playwright_auto_approve(full_url: str, email: str, password: str,
 
 
 async def _auto_approve_device_link(verify_url: str, email: str, password: str) -> str:
-    """Auto-approve a Tidal device link with Camoufox-first + fast proxy cycling.
+    """Auto-approve a Tidal device link — HTTP-first, browser fallback.
 
-    Returns a reason string (same as _camoufox_full_approve):
-      "success" — device approved
-      "blocked" — DataDome/proxy issue (caller should try next proxy or account)
-      "wrong_password", "no_account", "no_subscription" — account failure
-      "error" — other failure
-
-    Only retries with proxies for "blocked" errors.
-    Account-level failures (wrong_password, no_account, no_subscription) are
-    returned immediately so the caller can try the next account.
+    Phase 1: curl_cffi HTTP (fastest — ~3s, with Camoufox DataDome cookies)
+    Phase 2: Camoufox direct (browser, ~30s)
+    Phase 3: Camoufox + random proxies (if blocked)
+    Phase 4: Playwright fallback
     """
-    if not HAS_CAMOUFOX and not HAS_PLAYWRIGHT:
-        logger.warning("No browser engine — falling back to curl_cffi")
-        ok = await _tidal_http_auto_approve(verify_url, email, password, None)
-        return "success" if ok else "error"
-
     full_url = verify_url if verify_url.startswith("http") else f"https://{verify_url}"
 
-    # ── Phase 1: Camoufox direct ───────────────────────────────────────
+    # ── Phase 1: HTTP-only (fastest) ──
+    logger.info("HTTP [direct]: → %s", email)
+    result = await _tidal_http_auto_approve(verify_url, email, password, browser=None)
+    if result == "success":
+        return "success"
+    if result in ("wrong_password", "no_account", "no_subscription"):
+        return result
+    logger.info("HTTP failed (%s) for %s — trying Camoufox", result, email)
+
+    # ── Phase 2: Camoufox direct ──
     if HAS_CAMOUFOX:
         logger.info("Camoufox [direct]: → %s", email)
         result = await _camoufox_full_approve(full_url, email, password, proxy_url=None)
-
-        # Account-level failures → stop immediately, don't retry proxies
-        if result in ("wrong_password", "no_account", "no_subscription"):
+        if result in ("wrong_password", "no_account", "no_subscription", "success"):
             return result
 
-        if result == "success":
-            return "success"
-        # result == "blocked" or "error" → try proxies
-        logger.info("Camoufox [direct] failed (%s) for %s — switching to proxy rotation", result, email)
-
-    # ── Phase 2: Camoufox + random proxy cycling ───────────────────────
+    # ── Phase 3: Camoufox + random proxies ──
     if HAS_CAMOUFOX and _proxies:
         max_proxy_attempts = min(8, len(_proxies) * 2)
         used_proxies: set[str] = set()
@@ -2261,24 +2204,16 @@ async def _auto_approve_device_link(verify_url: str, email: str, password: str) 
             logger.info("Camoufox [proxy %d/%d]: %s → %s",
                         attempt + 1, max_proxy_attempts, proxy_key, email)
             result = await _camoufox_full_approve(full_url, email, password, proxy_url=proxy_url)
-
-            # Account failure → stop, don't waste more proxy attempts
-            if result in ("wrong_password", "no_account", "no_subscription"):
+            if result in ("wrong_password", "no_account", "no_subscription", "success"):
                 return result
-            if result == "success":
-                return "success"
-            # "blocked" or "error" → try next proxy
 
-    # ── Phase 3: Playwright fallback ───────────────────────────────────
+    # ── Phase 4: Playwright fallback ──
     if HAS_PLAYWRIGHT:
         logger.info("Playwright [direct]: → %s", email)
         if await _playwright_auto_approve(full_url, email, password, proxy_url=None):
             return "success"
 
-    # ── Phase 4: curl_cffi bare HTTP (last resort) ─────────────────────
-    logger.info("curl_cffi fallback → %s", email)
-    ok = await _tidal_http_auto_approve(verify_url, email, password, None)
-    return "success" if ok else "error"
+    return "error"
 
 
 async def _password_login() -> bool:
