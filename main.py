@@ -306,10 +306,19 @@ def load_proxies():
 
 
 def _random_proxy() -> str | None:
-    """Return a random proxy URL from the pool, or None if empty."""
+    """Return a random proxy URL from the pool, prioritizing squid proxies.
+
+    Squid proxies (squidproxies.com) are faster and more reliable for
+    Tidal's DataDome bypass.  We pick from them first (~80% of the time),
+    falling back to other proxies for diversity.
+    """
     if not _proxies:
         return None
-    return random.choice(_proxies)
+    squid = [p for p in _proxies if "squidproxies" in p]
+    others = [p for p in _proxies if "squidproxies" not in p]
+    # Prefer squid 80% of the time, others 20%
+    pool = squid if (squid and random.random() < 0.8) or not others else (others or _proxies)
+    return random.choice(pool)
 
 
 def _parse_proxy_for_browser(proxy_url: str) -> dict:
@@ -1412,12 +1421,21 @@ async def _camoufox_full_approve(full_url: str, email: str, password: str,
         except Exception:
             pass
 
+        post_body = (await _body_text(page)).lower()
+        post_btns = await _visible_button_texts(page)
         logger.info("Camoufox [%s]: after Continue — URL: %s  buttons: %s",
-                     label, page.url[:120],
-                     (await _visible_button_texts(page))[:10])
+                     label, page.url[:120], post_btns[:10])
+
+        # Detect "Create your account" / no existing Tidal account — kill immediately
+        if any(phrase in post_body for phrase in (
+            "create your account", "create a new account",
+            "sign up for tidal", "new to tidal",
+        )) and not any(kw in post_body for kw in ("log in with password", "enter your password")):
+            logger.warning("Camoufox [%s]: 'Create account' shown after email — bad account, killing session", label)
+            return "no_account"
 
         # Handle 6-digit code page → click "Log in with password"
-        body_lower = (await _body_text(page)).lower()
+        body_lower = post_body
         if "check your email" in body_lower or ("digit" in body_lower and "code" in body_lower):
             logger.info("Camoufox [%s]: on code page — clicking 'Log in with password'", label)
             for pwd_sel in ("button:has-text('Log in with password')",
