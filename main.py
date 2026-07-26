@@ -1078,9 +1078,23 @@ async def _tidal_http_auto_approve(verify_url: str, email: str, password: str, b
     full_url = verify_url if verify_url.startswith("http") else f"https://{verify_url}"
     logger.info("HTTP [%s]: starting (code=%s)", email, device_code)
 
-    # ── Step 0: Get DataDome cookies from Camoufox (fast 2s visit) ──
+    # ── Step 0: Try bare curl_cffi first (fastest — no browser) ──
     dd_cookies: dict[str, str] = {}
-    if HAS_CAMOUFOX and browser is None:
+    try:
+        async with _CurlSession(impersonate="safari17_0") as bare_session:
+            bare_resp = await bare_session.get(full_url, timeout=10, allow_redirects=True)
+            bare_url = str(bare_resp.url)
+            if "login.tidal.com" in bare_url:
+                # Bare request worked — no DataDome block!
+                logger.info("HTTP [%s]: bare curl_cffi passed DataDome", email)
+                dd_cookies = dict(bare_session.cookies)
+            else:
+                logger.info("HTTP [%s]: bare curl_cffi blocked, trying Camoufox cookies...", email)
+    except Exception:
+        logger.info("HTTP [%s]: bare curl_cffi failed, trying Camoufox cookies...", email)
+
+    # Only launch Camoufox if bare request was blocked
+    if not dd_cookies and HAS_CAMOUFOX:
         try:
             from camoufox.async_api import AsyncCamoufox
             kw = _camoufox_kwargs(fingerprint_preset=True,
@@ -1096,18 +1110,18 @@ async def _tidal_http_auto_approve(verify_url: str, email: str, password: str, b
                 for c in await pg.context.cookies():
                     dd_cookies[c["name"]] = c["value"]
                 await pg.close()
-            logger.info("HTTP [%s]: got %d DataDome cookies from Camoufox", email, len(dd_cookies))
+            logger.info("HTTP [%s]: got %d cookies from Camoufox", email, len(dd_cookies))
         except Exception as e:
-            logger.info("HTTP [%s]: Camoufox cookie extraction failed: %s", email, e)
+            logger.info("HTTP [%s]: Camoufox failed: %s", email, e)
 
     try:
         async with _CurlSession(impersonate="safari17_0") as session:
-            # Inject DataDome cookies if we have them
+            # Inject cookies if we have them
             if dd_cookies:
                 session.headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in dd_cookies.items())
 
             # ── Step 1: Follow redirect chain to login.tidal.com ──
-            resp = await session.get(full_url, timeout=15, allow_redirects=True)
+            resp = await session.get(full_url, timeout=10, allow_redirects=True)
             final_url = str(resp.url)
             logger.info("HTTP [%s]: redirect chain → %s", email, final_url[:120])
 
