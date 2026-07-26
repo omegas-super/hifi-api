@@ -383,7 +383,7 @@ async def _fetch_oxaam_tidal_creds() -> list[dict]:
     loop = asyncio.get_event_loop()
 
     def _scrape() -> list[dict]:
-        with Session(impersonate="chrome120") as session:
+        with Session(impersonate="safari17_0") as session:
             # 1. GET the login page to pick up session cookies
             session.get("https://www.oxaam.com/login.php", timeout=20)
 
