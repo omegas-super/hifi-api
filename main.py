@@ -442,23 +442,32 @@ if USE_PROXIES and not _proxies:
     logger.warning("USE_PROXIES enabled but no proxies loaded from %s", PROXIES_FILE)
 
 if os.path.exists(TOKEN_FILE):
-    with open(TOKEN_FILE, "r") as tok:
-        token_data = json.load(tok)
-        if isinstance(token_data, dict):
-            token_data = [token_data]
+    # Docker volume mount may create a directory instead of a file
+    if os.path.isdir(TOKEN_FILE):
+        logger.warning("TOKEN_FILE '%s' is a directory (Docker volume issue?) — removing it", TOKEN_FILE)
+        try:
+            os.rmdir(TOKEN_FILE)
+        except OSError:
+            import shutil
+            shutil.rmtree(TOKEN_FILE, ignore_errors=True)
+    elif os.path.isfile(TOKEN_FILE):
+        with open(TOKEN_FILE, "r") as tok:
+            token_data = json.load(tok)
+            if isinstance(token_data, dict):
+                token_data = [token_data]
 
-        for entry in token_data:
-            cred = {
-                "client_id": entry.get("client_ID") or CLIENT_ID,
-                "client_secret": entry.get("client_secret") or CLIENT_SECRET,
-                "refresh_token": entry.get("refresh_token") or REFRESH_TOKEN,
-                "user_id": entry.get("userID") or USER_ID,
-                # Access tokens in file have unknown expiry; force refresh on first use
-                "access_token": None,
-                "expires_at": 0,
-            }
-            if cred["refresh_token"]:
-                _creds.append(cred)
+            for entry in token_data:
+                cred = {
+                    "client_id": entry.get("client_ID") or CLIENT_ID,
+                    "client_secret": entry.get("client_secret") or CLIENT_SECRET,
+                    "refresh_token": entry.get("refresh_token") or REFRESH_TOKEN,
+                    "user_id": entry.get("userID") or USER_ID,
+                    # Access tokens in file have unknown expiry; force refresh on first use
+                    "access_token": None,
+                    "expires_at": 0,
+                }
+                if cred["refresh_token"]:
+                    _creds.append(cred)
 
 # Add env var credential if available and unique (simple check)
 if REFRESH_TOKEN:

@@ -24,6 +24,9 @@ RUN pip install --upgrade pip && \
 
 COPY . .
 
+# Ensure token.json exists as a file (Docker volume creates dir if source is missing)
+RUN [ -f token.json ] || echo '[]' > token.json
+
 # Camoufox: headless='virtual' auto-spawns Xvfb for WAF bypass
 # Playwright: Chromium headless with --disable-blink-features=AutomationControlled
 # Proxy rotation: direct → proxies for both engines, curl_cffi as last resort
