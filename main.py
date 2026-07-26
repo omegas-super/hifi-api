@@ -1052,15 +1052,26 @@ async def _tidal_http_auto_approve(verify_url: str, email: str, password: str, b
                 pass
             await asyncio.sleep(1.5)
 
-            # Check if DataDome passed — look for the login form (new selectors)
+            # Check if DataDome passed — look for the login form
             login_detected = False
+            _CONTINUE_WORDS = ["continue", "continuar", "continuer", "weiter", "avanti",
+                               "volgen", "dalej", "dalje", "devam", "proceeder"]
             for sel in ("input[placeholder*='email' i]", "input[placeholder*='username' i]",
-                        "input[name='email']", "input[type='email']", "#email",
-                        "button:has-text('Continue')"):
+                        "input[name='email']", "input[type='email']", "#email"):
                 try:
                     if await page.locator(sel).count() > 0:
                         login_detected = True
                         break
+                except Exception:
+                    pass
+            if not login_detected:
+                # Also detect by button text in any language
+                try:
+                    all_btns = await page.locator("button").all_text_contents()
+                    for btn_text in all_btns:
+                        if btn_text.strip().lower() in _CONTINUE_WORDS:
+                            login_detected = True
+                            break
                 except Exception:
                     pass
             # Also check heading text
@@ -1390,28 +1401,47 @@ async def _camoufox_full_approve(full_url: str, email: str, password: str,
             await email_input.press("Tab")
         await asyncio.sleep(0.5)
 
-        # Wait for Continue to enable
+        # Wait for Continue to enable (multilingual)
+        _CONTINUE_WORDS = ["continue", "continuar", "continuer", "weiter", "avanti",
+                           "volgen", "dalej", "dalje", "devam", "proceeder"]
         try:
             await page.wait_for_function(
-                "() => { for (const b of document.querySelectorAll('button')) {"
-                " if (b.innerText.trim().toLowerCase()==='continue' && !b.disabled) return true; } return false; }",
+                "() => { const words = " + json.dumps(_CONTINUE_WORDS) + " ;"
+                "for (const b of document.querySelectorAll('button')) {"
+                " if (!b.disabled && words.includes(b.innerText.trim().toLowerCase())) return true; }"
+                " return false; }",
                 timeout=12_000,
             )
         except Exception:
             pass
 
-        # Click Continue
-        for sel in ("button:not([disabled]):has-text('Continue')", "button:has-text('Continue')",
-                     "button[type='submit']"):
+        # Click Continue (multilingual)
+        clicked = False
+        for word in _CONTINUE_WORDS:
+            for sel in (f"button:not([disabled]):has-text('{word.title()}')",
+                        f"button:has-text('{word.title()}')"):
+                try:
+                    loc = page.locator(sel).first
+                    if await loc.count() > 0 and await loc.is_enabled():
+                        await loc.click(timeout=5_000)
+                        clicked = True
+                        logger.info("Camoufox [%s]: clicked Continue ('%s') via %s", label, word, sel)
+                        break
+                except Exception:
+                    continue
+            if clicked:
+                break
+        if not clicked:
+            # Fallback: click any submit button
             try:
-                loc = page.locator(sel).first
-                if await loc.count() > 0 and await loc.is_enabled():
-                    await loc.click(timeout=5_000)
-                    logger.info("Camoufox [%s]: clicked Continue via %s", label, sel)
-                    break
+                submit = page.locator("button[type='submit']").first
+                if await submit.count() > 0:
+                    await submit.click(timeout=5_000)
+                    clicked = True
+                    logger.info("Camoufox [%s]: clicked submit button fallback", label)
             except Exception:
-                continue
-        else:
+                pass
+        if not clicked:
             with suppress(Exception):
                 await email_input.press("Enter")
 
@@ -1430,6 +1460,8 @@ async def _camoufox_full_approve(full_url: str, email: str, password: str,
         if any(phrase in post_body for phrase in (
             "create your account", "create a new account",
             "sign up for tidal", "new to tidal",
+            "crear tu cuenta", "créer", "konto erstellen",
+            "crea tu cuenta", "creeër", "utwórz",
         )) and not any(kw in post_body for kw in ("log in with password", "enter your password")):
             logger.warning("Camoufox [%s]: 'Create account' shown after email — bad account, killing session", label)
             return "no_account"
@@ -1571,9 +1603,25 @@ async def _camoufox_full_approve(full_url: str, email: str, password: str,
                         return "blocked"
 
                 # ── Step 3: Consent / approval / device-link loop ─────
-                CONSENT_BTNS = ["Continue", "Allow", "ALLOW", "Authorize", "Confirm", "OK", "Yes", "Accept"]
-                APPROVE_BTNS = ["Allow", "Continue", "APPROVE", "Approve", "Authorize",
-                                "Grant access", "Allow access", "Link device", "OK", "Confirm"]
+                # Multilingual button labels — English, Spanish, French, German, Italian,
+                # Dutch, Polish, Turkish, Portuguese, Japanese, etc.
+                CONSENT_BTNS = [
+                    "Continue", "Continuar", "Continuer", "Weiter", "Avanti",
+                    "Volgen", "Dalej", "Devam", "Prosseguir", "Proceder",
+                    "Allow", "Autoriser", "Erlauben", "Autorizzare",
+                    "Autoriseren", "Zezwolić", "Onayla",
+                    "Confirm", "OK", "Yes", "Sí", "Oui", "Ja", "Tak",
+                    "Accept", "Aceptar", "Accepter", "Akzeptieren",
+                ]
+                APPROVE_BTNS = [
+                    "Continue", "Continuar", "Continuer", "Weiter", "Avanti",
+                    "Allow", "Autoriser", "Erlauben", "Autorizzare",
+                    "Approve", "Approve", "Aprobar", "Approuver",
+                    "Authorize", "Autorizar", "Autorisieren",
+                    "Grant access", "Allow access", "Link device",
+                    "Vincular", "Lier", "Verbinden", "Koppelen",
+                    "OK", "Confirm", "Accept", "Aceptar", "Accepter",
+                ]
 
                 clicked = False
                 re_navigated = False
@@ -1641,11 +1689,19 @@ async def _camoufox_full_approve(full_url: str, email: str, password: str,
                                     if val and len(val) >= 4:
                                         logger.info("Camoufox [%s]: device code auto-entered: '%s' — clicking Continue", label, val)
                                         # Click the Continue button next to the code input
-                                        continue_btn = page.locator("button:has-text('Continue')").first
-                                        if await continue_btn.count() > 0:
-                                            await continue_btn.click(timeout=5_000)
-                                            logger.info("Camoufox [%s]: clicked Continue after device code entry ✓", label)
-                                            clicked = True
+                                        continue_btn_words = ["continue", "continuar", "continuer",
+                                        "weiter", "avanti", "volgen", "dalej", "devam"]
+                                        for cw in continue_btn_words:
+                                            continue_btn = page.locator(f"button:has-text('{cw.title()}')").first
+                                            try:
+                                                if await continue_btn.count() > 0:
+                                                    await continue_btn.click(timeout=5_000)
+                                                    logger.info("Camoufox [%s]: clicked Continue ('%s') after device code entry ✓", label, cw)
+                                                    clicked = True
+                                                    break
+                                            except Exception:
+                                                continue
+                                        if clicked:
                                             break
                             except Exception:
                                 continue
@@ -2043,15 +2099,20 @@ async def _playwright_auto_approve(full_url: str, email: str, password: str,
 
                 # ── Step 3: Unified consent / approval loop ────────────
                 CONSENT_BTNS = [
-                    "Continue", "CONTINUE", "Allow", "ALLOW",
-                    "Authorize", "Confirm", "OK", "Yes",
-                    "Agree", "Accept", "ACCEPT",
+                    "Continue", "Continuar", "Continuer", "Weiter", "Avanti",
+                    "Volgen", "Dalej", "Devam", "Prosseguir",
+                    "Allow", "Autoriser", "Erlauben", "Autorizzare",
+                    "Confirm", "OK", "Yes", "Sí", "Oui", "Ja", "Tak",
+                    "Accept", "Aceptar", "Accepter", "Akzeptieren",
                 ]
                 APPROVE_BTNS = [
-                    "Allow", "ALLOW", "Approve", "APPROVE",
-                    "Authorize", "Yes, allow", "Grant access",
-                    "Allow access", "Link device", "Continue", "CONTINUE",
-                    "OK", "Confirm", "Accept", "ACCEPT",
+                    "Continue", "Continuar", "Continuer", "Weiter", "Avanti",
+                    "Allow", "Autoriser", "Erlauben", "Autorizzare",
+                    "Approve", "Aprobar", "Approuver",
+                    "Authorize", "Autorizar", "Autorisieren",
+                    "Grant access", "Allow access", "Link device",
+                    "Vincular", "Lier", "Verbinden", "Koppelen",
+                    "OK", "Confirm", "Accept", "Aceptar", "Accepter",
                 ]
 
                 clicked = False
