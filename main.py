@@ -1680,13 +1680,23 @@ async def _camoufox_full_approve(full_url: str, email: str, password: str,
                             continue
 
                     elif "offer.tidal.com" in cur:
-                        # Redirected to generic /device/link → navigate back
-                        if "/device/link" in cur and not re_navigated:
-                            logger.info("Camoufox [%s]: /device/link → navigating to %s", label, full_url[:120])
-                            re_navigated = True
-                            await page.goto(full_url, timeout=30_000, wait_until="domcontentloaded")
+                        # On /device/link — device code is auto-filled,
+                        # just click Continue with a 2s delay
+                        if "/device/link" in cur:
+                            if not re_navigated:
+                                logger.info("Camoufox [%s]: on /device/link — waiting 2s then clicking Continue", label)
+                                re_navigated = True
+                                await asyncio.sleep(2)
+                            btn = await _click_first_match(page, APPROVE_BTNS)
+                            if btn:
+                                logger.info("Camoufox [%s]: clicked Continue on /device/link ✓", label)
+                                clicked = True
+                                break
+                            else:
+                                logger.info("Camoufox [%s]: no Continue btn on /device/link — buttons: %s", label, btns[:6])
+                            # Wait for navigation after click
                             try:
-                                await page.wait_for_load_state("networkidle", timeout=15_000)
+                                await page.wait_for_load_state("networkidle", timeout=10_000)
                             except Exception:
                                 pass
                             await asyncio.sleep(2)
@@ -1700,38 +1710,6 @@ async def _camoufox_full_approve(full_url: str, email: str, password: str,
                         else:
                             logger.info("Camoufox [%s]: no approve btn — buttons: %s", label, btns[:6])
                     else:
-                        # Might be device page with code input + Continue
-                        # This is the key fix: device code auto-entered → click Continue
-                        for code_sel in (
-                            "input[placeholder*='WADIY']",
-                            "input[placeholder*='code' i]",
-                            "input[placeholder*='e.g.' i]",
-                        ):
-                            try:
-                                code_input = page.locator(code_sel).first
-                                if await code_input.count() > 0 and await code_input.is_visible():
-                                    val = await code_input.input_value()
-                                    if val and len(val) >= 4:
-                                        logger.info("Camoufox [%s]: device code auto-entered: '%s' — clicking Continue", label, val)
-                                        # Click the Continue button next to the code input
-                                        continue_btn_words = ["continue", "continuar", "continuer",
-                                        "weiter", "avanti", "volgen", "dalej", "devam"]
-                                        for cw in continue_btn_words:
-                                            continue_btn = page.locator(f"button:has-text('{cw.title()}')").first
-                                            try:
-                                                if await continue_btn.count() > 0:
-                                                    await continue_btn.click(timeout=5_000)
-                                                    logger.info("Camoufox [%s]: clicked Continue ('%s') after device code entry ✓", label, cw)
-                                                    clicked = True
-                                                    break
-                                            except Exception:
-                                                continue
-                                        if clicked:
-                                            break
-                            except Exception:
-                                continue
-                        if clicked:
-                            break
                         logger.info("Camoufox [%s]: unknown page — waiting", label)
 
                     try:
