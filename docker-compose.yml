@@ -5,8 +5,6 @@ services:
       - .env
     ports:
       - "0.0.0.0:8000:8000"
-    volumes:
-      - ./token.json:/app/token.json
     restart: unless-stopped
 
 networks:
