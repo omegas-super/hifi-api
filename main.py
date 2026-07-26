@@ -575,17 +575,41 @@ async def _fetch_oxaam_curl_cffi() -> list[dict] | None:
             html = fs_resp.text
             logger.info("curl_cffi: freeservice.php HTML size: %d chars", len(html))
 
-            # 4. Parse CREDENTIALS (same non-greedy regex as browser path)
+            # 4. Extract ONLY Tiedla section credentials
+            # The page has multiple <details> sections for different services.
+            # We want ONLY the <!-- Tiedla --> section which contains:
+            #   const CREDENTIALS = [{email, password, link}];
             all_creds: list[dict] = []
             seen_emails: set[str] = set()
 
+            # Step A: isolate the Tiedla section HTML (between <!-- Tiedla --> and next </details>)
+            tiedla_section = ""
+            tiedla_match = _re.search(
+                r"<!--\s*Tiedla\s*-->.*?<details[^>]*>(.*?)</details>",
+                html, _re.DOTALL | _re.IGNORECASE,
+            )
+            if tiedla_match:
+                tiedla_section = tiedla_match.group(1)
+                logger.info("curl_cffi: Tiedla section found (%d chars)", len(tiedla_section))
+            else:
+                # Fallback: try to find "Tiedla" keyword and grab surrounding content
+                idx = html.lower().find("tiedla")
+                if idx >= 0:
+                    # Grab 5000 chars after the Tiedla marker
+                    tiedla_section = html[idx:idx + 5000]
+                    logger.info("curl_cffi: Tiedla marker found at %d, extracted %d chars", idx, len(tiedla_section))
+                else:
+                    logger.warning("curl_cffi: no Tiedla section found in freeservice.php")
+                    tiedla_section = html  # last resort: search entire page
+
+            # Step B: extract CREDENTIALS from the Tiedla section
             for pattern in (
                 r"const\s+CREDENTIALS\s*=\s*(\[.*?\])\s*;",
                 r"var\s+CREDENTIALS\s*=\s*(\[.*?\])\s*;",
                 r"let\s+CREDENTIALS\s*=\s*(\[.*?\])\s*;",
                 r"CREDENTIALS\s*=\s*(\[.*?\])\s*;",
             ):
-                for match in _re.finditer(pattern, html, _re.DOTALL):
+                for match in _re.finditer(pattern, tiedla_section, _re.DOTALL):
                     try:
                         parsed = _json.loads(match.group(1))
                         for c in parsed:
@@ -594,14 +618,15 @@ async def _fetch_oxaam_curl_cffi() -> list[dict] | None:
                             if e and p and e not in seen_emails:
                                 seen_emails.add(e)
                                 all_creds.append({"email": e, "password": p})
+                        logger.info("curl_cffi: Tiedla CREDENTIALS block: %d accounts", len(parsed))
                     except _json.JSONDecodeError:
                         continue
 
-            # Also try inline Email/Password patterns
+            # Step C: also try inline Email/Password patterns in Tiedla section
             inline_blocks = _re.findall(
                 r'Email[^<]*➜[^<]*<[^>]*data-copy="([^"]+)"[^>]*>.*?'
                 r'Password[^<]*➜\s*([^\s<]{3,60})',
-                html, _re.DOTALL,
+                tiedla_section, _re.DOTALL,
             )
             for email_val, pass_val in inline_blocks:
                 email_val = email_val.strip()
@@ -612,7 +637,7 @@ async def _fetch_oxaam_curl_cffi() -> list[dict] | None:
 
             if all_creds:
                 logger.info(
-                    "curl_cffi: extracted %d Tidal credentials: %s",
+                    "curl_cffi: extracted %d Tiedla credentials: %s",
                     len(all_creds),
                     ", ".join(c["email"] for c in all_creds[:5]),
                 )
