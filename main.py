@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import aiohttp
 import asyncio
 import json
 import os
@@ -9,8 +10,6 @@ import time
 from urllib.parse import urlparse, unquote
 from contextlib import asynccontextmanager, suppress
 from typing import Dict, List, Optional, Union
-
-import httpx
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request, Response
@@ -53,9 +52,9 @@ load_dotenv()
 
 API_VERSION = "2.10"
 
-# Shared HTTP client is created in app lifespan for connection reuse
-_http_client: Optional[httpx.AsyncClient] = None
-_http_client_lock = asyncio.Lock()
+# Shared HTTP session (aiohttp.ClientSession) created in app lifespan
+_http_session: Optional[aiohttp.ClientSession] = None
+_http_session_lock = asyncio.Lock()
 
 # One lock per credential to avoid global contention during token refreshes
 _refresh_locks: Dict[str, asyncio.Lock] = {}
@@ -151,36 +150,31 @@ def _camoufox_kwargs(
     return kwargs
 
 
-def _build_http_client(proxy_url: Optional[str] = None) -> httpx.AsyncClient:
-    # Pack common settings into a dictionary to keep things DRY
-    client_kwargs = {
-        "http2": True,
-        "headers": _tidal_headers(),
-        "timeout": httpx.Timeout(connect=3.0, read=12.0, write=8.0, pool=12.0),
-        "limits": httpx.Limits(
-            max_keepalive_connections=500,
-            max_connections=1000,
-            keepalive_expiry=30.0,
-        ),
-    }
-
-    try:
-        # Modern httpx
-        return httpx.AsyncClient(proxy=proxy_url, **client_kwargs)
-    except TypeError:
-        # Legacy httpx
-        # If proxy_url is None, proxies=None is perfectly valid.
-        # If it's a string, older httpx versions require it to be a dictionary mapping.
-        legacy_proxies = {"all://": proxy_url} if proxy_url else None
-        return httpx.AsyncClient(proxies=legacy_proxies, **client_kwargs)
+def _build_http_session(proxy_url: Optional[str] = None) -> aiohttp.ClientSession:
+    """Build an aiohttp.ClientSession with optimal connection pooling and timeouts."""
+    connector = aiohttp.TCPConnector(
+        limit=1000,
+        limit_per_host=500,
+        ttl_dns_cache=300,
+        enable_cleanup_closed=True,
+        force_close=False,
+    )
+    timeout = aiohttp.ClientTimeout(total=12, connect=3, sock_read=12, sock_write=8)
+    session = aiohttp.ClientSession(
+        connector=connector,
+        timeout=timeout,
+        headers=_tidal_headers(),
+        cookie_jar=aiohttp.CookieJar(unsafe=True),
+    )
+    return session
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _http_client
+    global _http_session
     if DEV_MODE:
         logger.warning("DEV_MODE is enabled — upstream responses will be logged at DEBUG level")
-    if _http_client is None:
+    if _http_session is None:
         proxy_url = None
         if USE_PROXIES:
             proxy_url = await get_working_proxy()
@@ -189,7 +183,7 @@ async def lifespan(app: FastAPI):
                 raise RuntimeError("No working proxies available")
             elif not proxy_url and FALLBACK_TO_DIRECT_CONNECTION:
                 logger.warning("Could not find a working proxy, falling back to direct connection. HOST IP MAY BE EXPOSED!")
-        _http_client = _build_http_client(proxy_url)
+        _http_session = _build_http_session(proxy_url)
 
     # Auto-login via Oxaam if no credentials were loaded from token.json / env
     # This covers: token.json missing, token.json empty, or no env vars set.
@@ -208,9 +202,9 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        if _http_client:
-            await _http_client.aclose()
-            _http_client = None
+        if _http_session:
+            await _http_session.close()
+            _http_session = None
 
 app = FastAPI(
     title="HiFi-RestAPI",
@@ -275,16 +269,16 @@ _RATE_LIMIT_MAX_RETRIES = 3
 _RATE_LIMIT_BASE_DELAY = 1.0
 _RATE_LIMIT_MAX_DELAY = 10.0
 
-def _log_response(method: str, url: str, resp: httpx.Response):
+async def _log_response(method: str, url: str, resp):
     if not DEV_MODE:
         return
+    try:
+        body = await resp.text()
+    except Exception:
+        body = "<unreadable>"
     logger.info(
         "[DEV] %s %s → %s\n  headers: %s\n  body: %s",
-        method,
-        url,
-        resp.status_code,
-        dict(resp.headers),
-        resp.text[:2000],
+        method, url, resp.status, dict(resp.headers), body[:2000],
     )
 
 try:
@@ -344,9 +338,10 @@ def _parse_proxy_for_browser(proxy_url: str) -> dict:
 
 async def test_proxy(proxy_url: str) -> bool:
     try:
-        async with httpx.AsyncClient(proxy=proxy_url, timeout=5.0) as client:
-            resp = await client.get("http://example.com")
-            return resp.status_code == 200
+        timeout = aiohttp.ClientTimeout(total=5)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get("http://example.com", proxy=proxy_url) as resp:
+                return resp.status == 200
     except Exception:
         return False
 
@@ -399,20 +394,16 @@ async def get_working_proxy(avoid_proxy: Optional[str] = None) -> Optional[str]:
         _last_known_good_proxy = selected_proxy[0]
     return selected_proxy[0]
 
-async def _delayed_close(client: httpx.AsyncClient):
+async def _delayed_close(session: aiohttp.ClientSession):
     await asyncio.sleep(15)
-    await client.aclose()
+    await session.close()
 
 async def update_global_client(force_new_proxy: bool = False):
-    global _http_client
-    async with _http_client_lock:
-        proxy_to_avoid = None
-        if force_new_proxy and _http_client and _http_client.proxy:
-            proxy_to_avoid = str(_http_client.proxy.url)
-
+    global _http_session
+    async with _http_session_lock:
         proxy_url = None
         if USE_PROXIES:
-            proxy_url = await get_working_proxy(avoid_proxy=proxy_to_avoid)
+            proxy_url = await get_working_proxy()
             if not proxy_url:
                 if FALLBACK_TO_DIRECT_CONNECTION:
                     logger.warning("Could not find a working proxy, falling back to direct connection. HOST IP MAY BE EXPOSED!")
@@ -420,19 +411,12 @@ async def update_global_client(force_new_proxy: bool = False):
                     logger.error("Could not find a working proxy and FALLBACK_TO_DIRECT_CONNECTION is False.")
                     raise HTTPException(status_code=503, detail="Service Unavailable")
 
-        # Only create a new client if the proxy is actually different
-        current_proxy_url: Optional[str] = None
-        if _http_client and _http_client.proxy:
-            current_proxy_url = str(_http_client.proxy.url)
-        if _http_client and current_proxy_url == proxy_url:
-            return
+        new_session = _build_http_session(proxy_url)
+        old_session = _http_session
+        _http_session = new_session
 
-        new_client = _build_http_client(proxy_url)
-        old_client = _http_client
-        _http_client = new_client
-
-        if old_client is not None:
-            asyncio.create_task(_delayed_close(old_client))
+        if old_session is not None:
+            asyncio.create_task(_delayed_close(old_session))
 
 
 if os.path.exists(PROXIES_FILE):
@@ -505,11 +489,11 @@ def _lock_for_cred(cred: dict) -> asyncio.Lock:
     return lock
 
 
-async def get_http_client() -> httpx.AsyncClient:
-    global _http_client
-    if _http_client is None:
-        async with _http_client_lock:
-            if _http_client is None:
+async def get_http_session() -> aiohttp.ClientSession:
+    global _http_session
+    if _http_session is None:
+        async with _http_session_lock:
+            if _http_session is None:
                 proxy_url = None
                 if USE_PROXIES:
                     proxy_url = await get_working_proxy()
@@ -517,8 +501,8 @@ async def get_http_client() -> httpx.AsyncClient:
                         raise HTTPException(status_code=503, detail="Service Unavailable")
                     elif not proxy_url and FALLBACK_TO_DIRECT_CONNECTION:
                         logger.warning("Could not find a working proxy, falling back to direct connection. HOST IP MAY BE EXPOSED!")
-                _http_client = _build_http_client(proxy_url)
-    return _http_client
+                _http_session = _build_http_session(proxy_url)
+    return _http_session
 
 
 import re as _re
@@ -2262,13 +2246,13 @@ async def _password_login() -> bool:
         tidal_user = candidate["email"]
         tidal_pass = candidate["password"]
 
-        async with httpx.AsyncClient(headers=_tidal_headers(), timeout=httpx.Timeout(10.0)) as client:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as client:
             dev_res = await client.post(
                 "https://auth.tidal.com/v1/oauth2/device_authorization",
                 data={"client_id": _cid, "scope": "r_usr+w_usr+w_sub"},
             )
             dev_res.raise_for_status()
-            dev_data = dev_res.json()
+            dev_data = await dev_res.json(content_type=None)
 
         device_code = dev_data["deviceCode"]
         verify_url = dev_data.get("verificationUriComplete", dev_data.get("verificationUri"))
@@ -2290,7 +2274,7 @@ async def _password_login() -> bool:
         approval_result: Optional[bool] = None
         approval_succeeded_at: Optional[float] = None
 
-        async with httpx.AsyncClient(headers=_tidal_headers(), timeout=httpx.Timeout(10.0)) as client:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as client:
             while time.time() < deadline:
                 await asyncio.sleep(interval)
 
@@ -2311,7 +2295,7 @@ async def _password_login() -> bool:
                         logger.warning("Auto-approval %s for %s; trying next candidate", approval_result, tidal_user)
                         break
 
-                poll = await client.post(
+                async with client.post(
                     "https://auth.tidal.com/v1/oauth2/token",
                     data={
                         "client_id": _cid,
@@ -2319,55 +2303,56 @@ async def _password_login() -> bool:
                         "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
                         "scope": "r_usr+w_usr+w_sub",
                     },
-                    auth=(_cid, _csec),
-                )
-                if poll.status_code == 200:
-                    data = poll.json()
-                    cred = {
-                        "client_id": _cid,
-                        "client_secret": _csec,
-                        "refresh_token": data["refresh_token"],
-                        "user_id": str(data["user"]["userId"]),
-                        "access_token": data["access_token"],
-                        "expires_at": time.time() + data.get("expires_in", 3600) - 60,
-                        "subscription_limited": False,
-                    }
-                    _creds.append(cred)
-                    entry = {
-                        "access_token": data["access_token"],
-                        "refresh_token": data["refresh_token"],
-                        "userID": data["user"]["userId"],
-                        "client_ID": _cid,
-                        "client_secret": _csec,
-                    }
-                    existing: list = []
-                    if os.path.exists(TOKEN_FILE):
-                        try:
-                            with open(TOKEN_FILE, "r") as f:
-                                existing = json.load(f)
-                            if isinstance(existing, dict):
-                                existing = [existing]
-                        except (ValueError, OSError):
-                            existing = []
-                    existing = [t for t in existing if t.get("client_ID") != _cid]
-                    existing.append(entry)
-                    with open(TOKEN_FILE, "w") as f:
-                        json.dump(existing, f, indent=4)
-                    logger.info("Device-code authorization succeeded (user_id=%s)", data["user"]["userId"])
-                    if not approval_task.done():
-                        approval_task.cancel()
-                        with suppress(asyncio.CancelledError):
-                            await approval_task
-                    return True
+                    auth=aiohttp.BasicAuth(_cid, _csec),
+                ) as poll:
+                    if poll.status == 200:
+                        data = await poll.json(content_type=None)
+                        cred = {
+                            "client_id": _cid,
+                            "client_secret": _csec,
+                            "refresh_token": data["refresh_token"],
+                            "user_id": str(data["user"]["userId"]),
+                            "access_token": data["access_token"],
+                            "expires_at": time.time() + data.get("expires_in", 3600) - 60,
+                            "subscription_limited": False,
+                        }
+                        _creds.append(cred)
+                        entry = {
+                            "access_token": data["access_token"],
+                            "refresh_token": data["refresh_token"],
+                            "userID": data["user"]["userId"],
+                            "client_ID": _cid,
+                            "client_secret": _csec,
+                        }
+                        existing: list = []
+                        if os.path.exists(TOKEN_FILE):
+                            try:
+                                with open(TOKEN_FILE, "r") as f:
+                                    existing = json.load(f)
+                                if isinstance(existing, dict):
+                                    existing = [existing]
+                            except (ValueError, OSError):
+                                existing = []
+                        existing = [t for t in existing if t.get("client_ID") != _cid]
+                        existing.append(entry)
+                        with open(TOKEN_FILE, "w") as f:
+                            json.dump(existing, f, indent=4)
+                        logger.info("Device-code authorization succeeded (user_id=%s)", data["user"]["userId"])
+                        if not approval_task.done():
+                            approval_task.cancel()
+                            with suppress(asyncio.CancelledError):
+                                await approval_task
+                        return True
 
-                try:
-                    err = poll.json().get("error", "")
-                except ValueError:
-                    err = ""
+                    try:
+                        poll_body = await poll.json(content_type=None)
+                        err = poll_body.get("error", "")
+                    except (ValueError, Exception):
+                        err = ""
 
-                if err == "expired_token":
-                    logger.warning("Device code expired for %s", tidal_user)
-                    break
+                    if err == "expired_token":
+                        logger.warning("Device code expired for %s", tidal_user)
+                        break
 
                 if approval_succeeded_at and time.time() - approval_succeeded_at > 30:
                     logger.error("Authorization never completed after approval for %s", tidal_user)
@@ -2396,8 +2381,8 @@ async def refresh_tidal_token(cred: Optional[dict] = None):
         max_retries = MAX_RETRIES if USE_PROXIES else 1
         for attempt in range(max_retries):
             try:
-                client = await get_http_client()
-                res = await client.post(
+                session = await get_http_session()
+                async with session.post(
                     "https://auth.tidal.com/v1/oauth2/token",
                     data={
                         "client_id": cred["client_id"],
@@ -2405,44 +2390,32 @@ async def refresh_tidal_token(cred: Optional[dict] = None):
                         "grant_type": "refresh_token",
                         "scope": "r_usr+w_usr+w_sub",
                     },
-                    auth=(cred["client_id"], cred["client_secret"]),
-                )
-                _log_response("POST", "https://auth.tidal.com/v1/oauth2/token", res)
+                    auth=aiohttp.BasicAuth(cred["client_id"], cred["client_secret"]),
+                ) as res:
+                    await _log_response("POST", "https://auth.tidal.com/v1/oauth2/token", res)
+                    body = await res.json(content_type=None)
 
-                if res.status_code in [400, 401]:
-                    try:
-                        error_data = res.json()
-                        if error_data.get("error") in ["invalid_client", "invalid_grant"]:
-                            # If the refresh token was revoked and we have password creds,
-                            # re-authenticate automatically so the API self-heals.
-                            if error_data.get("error") == "invalid_grant" and OXAAM_EMAIL and OXAAM_PASSWORD:
+                    if res.status in [400, 401]:
+                        if body.get("error") in ["invalid_client", "invalid_grant"]:
+                            if body.get("error") == "invalid_grant" and OXAAM_EMAIL and OXAAM_PASSWORD:
                                 logger.warning("Refresh token revoked; re-authenticating via password grant...")
                                 if await _password_login():
                                     return _creds[-1]["access_token"]
-                            logger.error(f"Tidal Auth Error: {error_data}")
-                            raise HTTPException(status_code=401, detail=f"Tidal Auth Error: {error_data.get('error_description')}")
-                    except ValueError:
-                        pass
+                            logger.error(f"Tidal Auth Error: {body}")
+                            raise HTTPException(status_code=401, detail=f"Tidal Auth Error: {body.get('error_description')}")
 
-                res.raise_for_status()
-                data = res.json()
-                new_token = data["access_token"]
-                expires_in = data.get("expires_in", 3600)
+                    res.raise_for_status()
+                    new_token = body["access_token"]
+                    expires_in = body.get("expires_in", 3600)
 
-                cred["access_token"] = new_token
-                cred["expires_at"] = time.time() + expires_in - 60
-                cred["subscription_limited"] = False
+                    cred["access_token"] = new_token
+                    cred["expires_at"] = time.time() + expires_in - 60
+                    cred["subscription_limited"] = False
 
-                return new_token
-            except httpx.RequestError as e:
+                    return new_token
+            except aiohttp.ClientError as e:
                 if USE_PROXIES and attempt < max_retries - 1:
-                    logger.warning(f"Proxy failed during token refresh: {e}. Healing proxy...")
-                    await update_global_client(force_new_proxy=True)
-                    continue
-                raise HTTPException(status_code=401, detail=f"Token refresh failed: {str(e)}")
-            except httpx.HTTPStatusError as e:
-                if USE_PROXIES and e.response.status_code in [403, 429] and attempt < max_retries - 1:
-                    logger.warning(f"Proxy blocked during token refresh ({e.response.status_code}). Healing proxy...")
+                    logger.warning(f"Request failed during token refresh: {e}. Healing proxy...")
                     await update_global_client(force_new_proxy=True)
                     continue
                 raise HTTPException(status_code=401, detail=f"Token refresh failed: {str(e)}")
@@ -2547,69 +2520,58 @@ async def _recover_subscription_limited_credential(url: str, cred: Optional[dict
 async def make_request(url: str, token: Optional[str] = None, params: Optional[dict] = None, cred: Optional[dict] = None):
     if token is None:
         token, cred = await get_tidal_token_for_cred(cred=cred)
-    client = await get_http_client()
+    session = await get_http_session()
     headers = {"authorization": f"Bearer {token}"}
 
     try:
         for attempt in range(_RATE_LIMIT_MAX_RETRIES + 1):
-            resp = await client.get(url, headers=headers, params=params)
-            _log_response("GET", url, resp)
+            async with session.get(url, headers=headers, params=params) as resp:
+                await _log_response("GET", url, resp)
 
-            if resp.status_code == 401:
-                token, cred = await get_tidal_token_for_cred(force_refresh=True, cred=cred)
-                headers = {"authorization": f"Bearer {token}"}
-                resp = await client.get(url, headers=headers, params=params)
-                _log_response("GET (retry after 401)", url, resp)
+                if resp.status == 401:
+                    token, cred = await get_tidal_token_for_cred(force_refresh=True, cred=cred)
+                    headers = {"authorization": f"Bearer {token}"}
+                    async with session.get(url, headers=headers, params=params) as retry_resp:
+                        await _log_response("GET (retry after 401)", url, retry_resp)
 
-            if resp.status_code == 429 and attempt < _RATE_LIMIT_MAX_RETRIES:
-                delay = min(_RATE_LIMIT_BASE_DELAY * (2 ** attempt), _RATE_LIMIT_MAX_DELAY)
-                retry_after = resp.headers.get("Retry-After")
-                if retry_after:
-                    try:
-                        delay = min(delay, max(float(retry_after), 0))
-                    except ValueError:
-                        pass
-                delay = min(delay, _RATE_LIMIT_MAX_DELAY)
-                logger.warning("Upstream 429 for %s, retrying in %.1fs (attempt %d/%d)", url, delay, attempt + 1, _RATE_LIMIT_MAX_RETRIES)
-                await asyncio.sleep(delay)
-                continue
+                if resp.status == 429 and attempt < _RATE_LIMIT_MAX_RETRIES:
+                    delay = min(_RATE_LIMIT_BASE_DELAY * (2 ** attempt), _RATE_LIMIT_MAX_DELAY)
+                    retry_after = resp.headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            delay = min(delay, max(float(retry_after), 0))
+                        except ValueError:
+                            pass
+                    delay = min(delay, _RATE_LIMIT_MAX_DELAY)
+                    logger.warning("Upstream 429 for %s, retrying in %.1fs (attempt %d/%d)", url, delay, attempt + 1, _RATE_LIMIT_MAX_RETRIES)
+                    await asyncio.sleep(delay)
+                    continue
 
-            if resp.status_code == 404:
-                fresh_token, fresh_cred = await get_tidal_token_for_cred(force_refresh=True, cred=cred)
-                if fresh_token != token:
-                    headers = {"authorization": f"Bearer {fresh_token}"}
-                    resp = await client.get(url, headers=headers, params=params)
-                    _log_response("GET (retry after 404 token refresh)", url, resp)
-                    token, cred = fresh_token, fresh_cred
+                if resp.status == 404:
+                    fresh_token, fresh_cred = await get_tidal_token_for_cred(force_refresh=True, cred=cred)
+                    if fresh_token != token:
+                        headers = {"authorization": f"Bearer {fresh_token}"}
+                        async with session.get(url, headers=headers, params=params) as retry_resp:
+                            await _log_response("GET (retry after 404 token refresh)", url, retry_resp)
+                        token, cred = fresh_token, fresh_cred
 
-            break
+                resp.raise_for_status()
+                body = await resp.json(content_type=None)
 
-        resp.raise_for_status()
-        body = resp.json()
+                if _is_subscription_limited(body):
+                    token, cred = await _recover_subscription_limited_credential(url, cred)
+                    headers = {"authorization": f"Bearer {token}"}
+                    async with session.get(url, headers=headers, params=params) as retry_resp:
+                        await _log_response("GET (retry after subscription-limited)", url, retry_resp)
+                        retry_resp.raise_for_status()
+                        body = await retry_resp.json(content_type=None)
 
-        # If Tidal returns PREVIEW/subscription-limited content, force-refresh the token
-        # and retry once — the credential may be stale or the account may no longer
-        # have subscription entitlements.
-        if _is_subscription_limited(body):
-            token, cred = await _recover_subscription_limited_credential(url, cred)
-            headers = {"authorization": f"Bearer {token}"}
-            retry_resp = await client.get(url, headers=headers, params=params)
-            _log_response("GET (retry after subscription-limited)", url, retry_resp)
-            retry_resp.raise_for_status()
-            body = retry_resp.json()
-
-        return {"version": API_VERSION, "data": body}
-    except httpx.HTTPStatusError as e:
-        logger.error(
-            "Upstream API error %s %s %s",
-            e.response.status_code,
-            url,
-            e.response.text[:1000],
-            exc_info=e,
-        )
-        raise HTTPException(status_code=e.response.status_code, detail="Upstream API error")
-    except httpx.RequestError as e:
-        if isinstance(e, httpx.TimeoutException):
+                return {"version": API_VERSION, "data": body}
+    except aiohttp.ClientResponseError as e:
+        logger.error("Upstream API error %s %s", e.status, url, exc_info=e)
+        raise HTTPException(status_code=e.status, detail="Upstream API error")
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        if isinstance(e, asyncio.TimeoutError):
             raise HTTPException(status_code=429, detail="Upstream timeout")
         raise HTTPException(status_code=503, detail="Connection error to Tidal")
 
@@ -2626,69 +2588,58 @@ async def authed_get_json(
     if token is None:
         token, cred = await get_tidal_token_for_cred(cred=cred)
 
-    client = await get_http_client()
+    session = await get_http_session()
     headers = {"authorization": f"Bearer {token}"}
 
     try:
         for attempt in range(_RATE_LIMIT_MAX_RETRIES + 1):
-            resp = await client.get(url, headers=headers, params=params)
-            _log_response("GET", url, resp)
+            async with session.get(url, headers=headers, params=params) as resp:
+                await _log_response("GET", url, resp)
 
-            if resp.status_code == 401:
-                token, cred = await get_tidal_token_for_cred(force_refresh=True, cred=cred)
-                headers["authorization"] = f"Bearer {token}"
-                resp = await client.get(url, headers=headers, params=params)
-                _log_response("GET (retry after 401)", url, resp)
+                if resp.status == 401:
+                    token, cred = await get_tidal_token_for_cred(force_refresh=True, cred=cred)
+                    headers["authorization"] = f"Bearer {token}"
+                    async with session.get(url, headers=headers, params=params) as retry_resp:
+                        await _log_response("GET (retry after 401)", url, retry_resp)
 
-            if resp.status_code == 429 and attempt < _RATE_LIMIT_MAX_RETRIES:
-                delay = min(_RATE_LIMIT_BASE_DELAY * (2 ** attempt), _RATE_LIMIT_MAX_DELAY)
-                retry_after = resp.headers.get("Retry-After")
-                if retry_after:
-                    try:
-                        delay = min(delay, max(float(retry_after), 0))
-                    except ValueError:
-                        pass
-                delay = min(delay, _RATE_LIMIT_MAX_DELAY)
-                logger.warning("Upstream 429 for %s, retrying in %.1fs (attempt %d/%d)", url, delay, attempt + 1, _RATE_LIMIT_MAX_RETRIES)
-                await asyncio.sleep(delay)
-                continue
+                if resp.status == 429 and attempt < _RATE_LIMIT_MAX_RETRIES:
+                    delay = min(_RATE_LIMIT_BASE_DELAY * (2 ** attempt), _RATE_LIMIT_MAX_DELAY)
+                    retry_after = resp.headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            delay = min(delay, max(float(retry_after), 0))
+                        except ValueError:
+                            pass
+                    delay = min(delay, _RATE_LIMIT_MAX_DELAY)
+                    logger.warning("Upstream 429 for %s, retrying in %.1fs (attempt %d/%d)", url, delay, attempt + 1, _RATE_LIMIT_MAX_RETRIES)
+                    await asyncio.sleep(delay)
+                    continue
 
-            if resp.status_code == 404:
-                fresh_token, fresh_cred = await get_tidal_token_for_cred(force_refresh=True, cred=cred)
-                if fresh_token != token:
-                    headers["authorization"] = f"Bearer {fresh_token}"
-                    resp = await client.get(url, headers=headers, params=params)
-                    _log_response("GET (retry after 404 token refresh)", url, resp)
-                    token, cred = fresh_token, fresh_cred
+                if resp.status == 404:
+                    fresh_token, fresh_cred = await get_tidal_token_for_cred(force_refresh=True, cred=cred)
+                    if fresh_token != token:
+                        headers["authorization"] = f"Bearer {fresh_token}"
+                        async with session.get(url, headers=headers, params=params) as retry_resp:
+                            await _log_response("GET (retry after 404 token refresh)", url, retry_resp)
+                        token, cred = fresh_token, fresh_cred
 
-            break
+                resp.raise_for_status()
+                body = await resp.json(content_type=None)
 
-        resp.raise_for_status()
-        body = resp.json()
+                if _is_subscription_limited(body):
+                    token, cred = await _recover_subscription_limited_credential(url, cred)
+                    headers["authorization"] = f"Bearer {token}"
+                    async with session.get(url, headers=headers, params=params) as retry_resp:
+                        await _log_response("GET (retry after subscription-limited)", url, retry_resp)
+                        retry_resp.raise_for_status()
+                        body = await retry_resp.json(content_type=None)
 
-        # If Tidal returns PREVIEW/subscription-limited content, force-refresh the token
-        # and retry once — the credential may be stale or the account may no longer
-        # have subscription entitlements.
-        if _is_subscription_limited(body):
-            token, cred = await _recover_subscription_limited_credential(url, cred)
-            headers["authorization"] = f"Bearer {token}"
-            retry_resp = await client.get(url, headers=headers, params=params)
-            _log_response("GET (retry after subscription-limited)", url, retry_resp)
-            retry_resp.raise_for_status()
-            body = retry_resp.json()
-
-        return body, token, cred
-    except httpx.HTTPStatusError as e:
-        logger.error(
-            "Upstream API error %s %s %s",
-            e.response.status_code,
-            url,
-            e.response.text[:1000],
-            exc_info=e,
-        )
-        raise HTTPException(status_code=e.response.status_code, detail="Upstream API error")
-    except httpx.RequestError as e:
-        if isinstance(e, httpx.TimeoutException):
+                return body, token, cred
+    except aiohttp.ClientResponseError as e:
+        logger.error("Upstream API error %s %s", e.status, url, exc_info=e)
+        raise HTTPException(status_code=e.status, detail="Upstream API error")
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        if isinstance(e, asyncio.TimeoutError):
             raise HTTPException(status_code=429, detail="Upstream timeout")
         raise HTTPException(status_code=503, detail="Connection error to Tidal")
 
@@ -2746,7 +2697,7 @@ async def get_track_manifests(
 # Not really necessary but I'm including it anyway
 @app.api_route("/widevine", methods=["GET", "POST"])
 async def widevine_proxy(request: Request):
-    client = await get_http_client()
+    session = await get_http_session()
     body = await request.body()
     url = "https://api.tidal.com/v2/widevine"
 
@@ -2757,20 +2708,24 @@ async def widevine_proxy(request: Request):
     }
 
     try:
-        resp = await client.request(request.method, url, headers=headers, content=body)
-        _log_response(request.method, url, resp)
+        async with session.request(request.method, url, headers=headers, data=body) as resp:
+            await _log_response(request.method, url, resp)
+            resp_body = await resp.read()
+            resp_headers = {"Content-Type": resp.headers.get("Content-Type", "application/json")}
 
-        if resp.status_code == 401:
-            token, cred = await get_tidal_token_for_cred(force_refresh=True, cred=cred)
-            headers["authorization"] = f"Bearer {token}"
-            resp = await client.request(request.method, url, headers=headers, content=body)
-            _log_response(f"{request.method} (retry)", url, resp)
+            if resp.status == 401:
+                token, cred = await get_tidal_token_for_cred(force_refresh=True, cred=cred)
+                headers["authorization"] = f"Bearer {token}"
+                async with session.request(request.method, url, headers=headers, data=body) as retry_resp:
+                    await _log_response(f"{request.method} (retry)", url, retry_resp)
+                    resp_body = await retry_resp.read()
+                    resp_headers = {"Content-Type": retry_resp.headers.get("Content-Type", "application/json")}
 
-        return Response(
-            content=resp.content,
-            status_code=resp.status_code,
-            headers={"Content-Type": resp.headers.get("Content-Type", "application/json")}
-        )
+            return Response(
+                content=resp_body,
+                status_code=resp.status,
+                headers=resp_headers,
+            )
     except Exception as e:
         raise HTTPException(status_code=502, detail="Error communicating with widevine server")
 
