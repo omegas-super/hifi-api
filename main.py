@@ -2521,7 +2521,12 @@ async def make_request(url: str, token: Optional[str] = None, params: Optional[d
     if token is None:
         token, cred = await get_tidal_token_for_cred(cred=cred)
     session = await get_http_session()
-    headers = {"authorization": f"Bearer {token}"}
+    # Add Origin/Referer for V2 API CORS bypass
+    headers = {
+        "authorization": f"Bearer {token}",
+        "Origin": "https://tidal.com",
+        "Referer": "https://tidal.com/",
+    }
 
     try:
         for attempt in range(_RATE_LIMIT_MAX_RETRIES + 1):
@@ -2589,7 +2594,13 @@ async def authed_get_json(
         token, cred = await get_tidal_token_for_cred(cred=cred)
 
     session = await get_http_session()
-    headers = {"authorization": f"Bearer {token}"}
+    # V2 API (openapi.tidal.com) requires Origin/Referer to bypass CORS protection
+    headers = {
+        "authorization": f"Bearer {token}",
+        "Origin": "https://tidal.com",
+        "Referer": "https://tidal.com/",
+        "Accept": "application/vnd.api+json",
+    }
 
     try:
         for attempt in range(_RATE_LIMIT_MAX_RETRIES + 1):
