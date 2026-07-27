@@ -159,7 +159,7 @@ def _build_http_session(proxy_url: Optional[str] = None) -> aiohttp.ClientSessio
         enable_cleanup_closed=True,
         force_close=False,
     )
-    timeout = aiohttp.ClientTimeout(total=12, connect=3, sock_read=12, sock_write=8)
+    timeout = aiohttp.ClientTimeout(total=12, connect=3, sock_read=12)
     session = aiohttp.ClientSession(
         connector=connector,
         timeout=timeout,
