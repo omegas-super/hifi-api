@@ -2534,6 +2534,10 @@ async def make_request(url: str, token: Optional[str] = None, params: Optional[d
         "Origin": "https://tidal.com",
         "Referer": "https://tidal.com/",
     }
+    # aiohttp rejects None, bool, and other non-numeric types in params.
+    # Note: bool is a subclass of int in Python, so must check explicitly.
+    if params:
+        params = {k: v for k, v in params.items() if isinstance(v, (str, int, float)) and not isinstance(v, bool)}
 
     try:
         for attempt in range(_RATE_LIMIT_MAX_RETRIES + 1):
@@ -2614,6 +2618,10 @@ async def authed_get_json(
         "Origin": "https://tidal.com",
         "Referer": "https://tidal.com/",
     }
+    # aiohttp rejects None, bool, and other non-numeric types in params.
+    # Note: bool is a subclass of int in Python, so must check explicitly.
+    if params:
+        params = {k: v for k, v in params.items() if isinstance(v, (str, int, float)) and not isinstance(v, bool)}
 
     try:
         for attempt in range(_RATE_LIMIT_MAX_RETRIES + 1):
