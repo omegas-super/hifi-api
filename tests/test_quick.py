@@ -14,6 +14,7 @@ ENDPOINTS = [
     ("Cover",              "/cover/?id=194567102"),
     ("Recommendations",    "/recommendations/?id=194567102"),
     ("Lyrics",             "/lyrics/?id=194567102"),
+    ("Track Manifests",    "/trackManifests/?id=495402660&formats=FLAC"),
 ]
 
 async def main():

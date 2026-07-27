@@ -2567,9 +2567,12 @@ async def make_request(url: str, token: Optional[str] = None, params: Optional[d
         "Referer": "https://tidal.com/",
     }
     # aiohttp rejects None, bool, and other non-numeric types in params.
-    # Note: bool is a subclass of int in Python, so must check explicitly.
+    # Also handle list-of-tuples params (used by trackManifests for duplicate keys).
     if params:
-        params = {k: v for k, v in params.items() if isinstance(v, (str, int, float)) and not isinstance(v, bool)}
+        if isinstance(params, list):
+            params = [(k, v) for k, v in params if isinstance(v, (str, int, float)) and not isinstance(v, bool)]
+        else:
+            params = {k: v for k, v in params.items() if isinstance(v, (str, int, float)) and not isinstance(v, bool)}
 
     try:
         for attempt in range(_RATE_LIMIT_MAX_RETRIES + 1):
@@ -2651,9 +2654,12 @@ async def authed_get_json(
         "Referer": "https://tidal.com/",
     }
     # aiohttp rejects None, bool, and other non-numeric types in params.
-    # Note: bool is a subclass of int in Python, so must check explicitly.
+    # Also handle list-of-tuples params (used by trackManifests for duplicate keys).
     if params:
-        params = {k: v for k, v in params.items() if isinstance(v, (str, int, float)) and not isinstance(v, bool)}
+        if isinstance(params, list):
+            params = [(k, v) for k, v in params if isinstance(v, (str, int, float)) and not isinstance(v, bool)]
+        else:
+            params = {k: v for k, v in params.items() if isinstance(v, (str, int, float)) and not isinstance(v, bool)}
 
     try:
         for attempt in range(_RATE_LIMIT_MAX_RETRIES + 1):
@@ -2665,8 +2671,6 @@ async def authed_get_json(
                     headers["authorization"] = f"Bearer {token}"
                     async with session.get(url, headers=headers, params=params) as retry_resp:
                         await _log_response("GET (retry after 401)", url, retry_resp)
-
-                if resp.status == 429 and attempt < _RATE_LIMIT_MAX_RETRIES:
                     delay = min(_RATE_LIMIT_BASE_DELAY * (2 ** attempt), _RATE_LIMIT_MAX_DELAY)
                     retry_after = resp.headers.get("Retry-After")
                     if retry_after:
