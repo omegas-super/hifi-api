@@ -2521,8 +2521,15 @@ async def make_request(url: str, token: Optional[str] = None, params: Optional[d
     if token is None:
         token, cred = await get_tidal_token_for_cred(cred=cred)
     session = await get_http_session()
-    # Add Origin/Referer for V2 API CORS bypass
+    # CRITICAL: aiohttp REPLACES session headers with per-request headers.
+    # Must merge session headers (User-Agent, Accept, etc.) with auth headers.
     headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "*/*",
+        "Accept-Encoding": "gzip",
+        "Accept-Language": "en-US,en;q=0.9",
+        "X-Platform": "android",
+        "X-Tidal-Platform": "android",
         "authorization": f"Bearer {token}",
         "Origin": "https://tidal.com",
         "Referer": "https://tidal.com/",
@@ -2594,12 +2601,18 @@ async def authed_get_json(
         token, cred = await get_tidal_token_for_cred(cred=cred)
 
     session = await get_http_session()
-    # V2 API (openapi.tidal.com) requires Origin/Referer to bypass CORS protection
+    # CRITICAL: aiohttp REPLACES session headers with per-request headers.
+    # Must merge session headers (User-Agent, Accept, etc.) with auth headers.
     headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "*/*",
+        "Accept-Encoding": "gzip",
+        "Accept-Language": "en-US,en;q=0.9",
+        "X-Platform": "android",
+        "X-Tidal-Platform": "android",
         "authorization": f"Bearer {token}",
         "Origin": "https://tidal.com",
         "Referer": "https://tidal.com/",
-        "Accept": "application/vnd.api+json",
     }
 
     try:
