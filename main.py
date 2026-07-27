@@ -151,20 +151,50 @@ def _camoufox_kwargs(
 
 
 def _build_http_session(proxy_url: Optional[str] = None) -> aiohttp.ClientSession:
-    """Build an aiohttp.ClientSession with optimal connection pooling and timeouts."""
+    """Build an aiohttp.ClientSession with optimal connection pooling and timeouts.
+    
+    Key enhancements from aiohttp docs:
+    - TCPConnector with DNS caching (300s TTL), connection limits, Happy Eyeballs
+    - ClientTimeout with granular control (total, connect, sock_read)
+    - CookieJar with unsafe=True for cross-domain cookies
+    - TraceConfig for DEV_MODE request/response logging
+    - read_bufsize=128KiB for large Tidal API responses
+    - auto_decompress=True for gzip responses
+    """
     connector = aiohttp.TCPConnector(
         limit=1000,
         limit_per_host=500,
         ttl_dns_cache=300,
         enable_cleanup_closed=True,
         force_close=False,
+        happy_eyeballs_delay=0.25,  # RFC 8305 — faster connection establishment
     )
-    timeout = aiohttp.ClientTimeout(total=12, connect=3, sock_read=12)
+    timeout = aiohttp.ClientTimeout(
+        total=12,       # Max 12s for entire request
+        connect=3,      # Max 3s to establish TCP connection
+        sock_read=12,   # Max 12s waiting for data from server
+    )
+
+    # Add trace config for DEV_MODE logging (lightweight, no-op when not DEV)
+    trace_configs = []
+    if DEV_MODE:
+        async def _on_request_start(session, trace_config_ctx, params):
+            logger.info("[TRACE] → %s %s", params.method, params.url)
+        async def _on_request_end(session, trace_config_ctx, params):
+            logger.info("[TRACE] ← %s %s %s", params.method, params.url, params.response.status)
+        tc = aiohttp.TraceConfig()
+        tc.on_request_start.append(_on_request_start)
+        tc.on_request_end.append(_on_request_end)
+        trace_configs.append(tc)
+
     session = aiohttp.ClientSession(
         connector=connector,
         timeout=timeout,
         headers=_tidal_headers(),
         cookie_jar=aiohttp.CookieJar(unsafe=True),
+        read_bufsize=2**17,       # 128KB buffer for large Tidal API responses
+        auto_decompress=True,     # Auto-decompress gzip/deflate responses
+        trace_configs=trace_configs if trace_configs else None,
     )
     return session
 
@@ -2303,7 +2333,8 @@ async def _password_login() -> bool:
                         "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
                         "scope": "r_usr+w_usr+w_sub",
                     },
-                    auth=aiohttp.BasicAuth(_cid, _csec),
+                    auth=None,
+                    headers={"Authorization": aiohttp.encode_basic_auth(_cid, _csec)},
                 ) as poll:
                     if poll.status == 200:
                         data = await poll.json(content_type=None)
@@ -2390,7 +2421,8 @@ async def refresh_tidal_token(cred: Optional[dict] = None):
                         "grant_type": "refresh_token",
                         "scope": "r_usr+w_usr+w_sub",
                     },
-                    auth=aiohttp.BasicAuth(cred["client_id"], cred["client_secret"]),
+                    auth=None,
+                    headers={"Authorization": aiohttp.encode_basic_auth(cred["client_id"], cred["client_secret"])},
                 ) as res:
                     await _log_response("POST", "https://auth.tidal.com/v1/oauth2/token", res)
                     body = await res.json(content_type=None)
