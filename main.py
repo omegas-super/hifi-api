@@ -2223,32 +2223,22 @@ async def _playwright_auto_approve(full_url: str, email: str, password: str,
 
 
 async def _auto_approve_device_link(verify_url: str, email: str, password: str) -> str:
-    """Auto-approve a Tidal device link — HTTP-first, browser fallback.
+    """Auto-approve a Tidal device link — Camoufox only.
 
-    Phase 1: curl_cffi HTTP (fastest — ~3s, with Camoufox DataDome cookies)
-    Phase 2: Camoufox direct (browser, ~30s)
-    Phase 3: Camoufox + random proxies (if blocked)
-    Phase 4: Playwright fallback
+    Phase 1: Camoufox direct (no proxy, 7s email timeout + reload)
+    Phase 2: Camoufox + random proxies (squid priority, 7s each)
     """
     full_url = verify_url if verify_url.startswith("http") else f"https://{verify_url}"
 
-    # ── Phase 1: HTTP-only (fastest) ──
-    logger.info("HTTP [direct]: → %s", email)
-    result = await _tidal_http_auto_approve(verify_url, email, password, browser=None)
-    if result == "success":
-        return "success"
-    if result in ("wrong_password", "no_account", "no_subscription"):
-        return result
-    logger.info("HTTP failed (%s) for %s — trying Camoufox", result, email)
-
-    # ── Phase 2: Camoufox direct ──
+    # ── Phase 1: Camoufox direct (no proxy) ──
     if HAS_CAMOUFOX:
         logger.info("Camoufox [direct]: → %s", email)
         result = await _camoufox_full_approve(full_url, email, password, proxy_url=None)
         if result in ("wrong_password", "no_account", "no_subscription", "success"):
             return result
+        logger.info("Camoufox [direct] failed (%s) for %s — trying proxies", result, email)
 
-    # ── Phase 3: Camoufox + random proxies ──
+    # ── Phase 2: Camoufox + random proxies (fast cycling, 7s timeout each) ──
     if HAS_CAMOUFOX and _proxies:
         max_proxy_attempts = min(8, len(_proxies) * 2)
         used_proxies: set[str] = set()
@@ -2267,12 +2257,7 @@ async def _auto_approve_device_link(verify_url: str, email: str, password: str) 
             result = await _camoufox_full_approve(full_url, email, password, proxy_url=proxy_url)
             if result in ("wrong_password", "no_account", "no_subscription", "success"):
                 return result
-
-    # ── Phase 4: Playwright fallback ──
-    if HAS_PLAYWRIGHT:
-        logger.info("Playwright [direct]: → %s", email)
-        if await _playwright_auto_approve(full_url, email, password, proxy_url=None):
-            return "success"
+            # Only retry on "blocked" — account failures stop immediately
 
     return "error"
 
