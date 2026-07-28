@@ -1654,9 +1654,66 @@ async def _camoufox_full_approve(full_url: str, email: str, password: str,
                             # Click Continue
                             btn = await _click_first_match(page, APPROVE_BTNS)
                             if btn:
-                                logger.info("Camoufox [%s]: clicked Continue on /device/link ✓", label)
-                                clicked = True
-                                break
+                                logger.info("Camoufox [%s]: clicked Continue on /device/link", label)
+                                # Wait and VERIFY approval worked
+                                try:
+                                    await page.wait_for_load_state("networkidle", timeout=15_000)
+                                except Exception:
+                                    pass
+                                await asyncio.sleep(3)
+                                # Check what happened after clicking Continue
+                                post_url = page.url
+                                post_body = (await _body_text(page)).lower()
+                                post_btns = await _visible_button_texts(page)
+                                logger.info("Camoufox [%s]: post-Continue URL: %s  buttons: %s",
+                                            label, post_url[:120], post_btns[:8])
+
+                                # Check for error messages
+                                if "error" in post_body or "erreur" in post_body:
+                                    logger.warning("Camoufox [%s]: error after Continue: %s", label, post_body[:200])
+                                    return "error"
+
+                                # Check for "Please provide a device code" (code not accepted)
+                                if "provide" in post_body and "device" in post_body:
+                                    logger.warning("Camoufox [%s]: device code not accepted on /device/link", label)
+                                    return "error"
+
+                                # If still on /device/link, try calling API directly via browser JS
+                                if "/device/link" in post_url:
+                                    user_code = full_url.rstrip("/").rsplit("/", 1)[-1]
+                                    logger.info("Camoufox [%s]: still on /device/link — calling API directly via JS", label)
+                                    try:
+                                        api_result = await page.evaluate(f"""async () => {{
+                                            const resp = await fetch('/api/device/link', {{
+                                                method: 'POST',
+                                                headers: {{'Content-Type': 'application/json'}},
+                                                body: JSON.stringify({{deviceCode: '{user_code}'}}),
+                                            }});
+                                            const text = await resp.text();
+                                            return {{status: resp.status, body: text.substring(0, 500)}};
+                                        }}""")
+                                        logger.info("Camoufox [%s]: /api/device/link → %s", label, api_result)
+                                        if api_result.get("status") in (200, 201, 204, 409):
+                                            logger.info("Camoufox [%s]: device linked via API ✓", label)
+                                            clicked = True
+                                            break
+                                    except Exception as exc:
+                                        logger.warning("Camoufox [%s]: JS API call failed: %s", label, exc)
+
+                                    # Check if page moved after API call
+                                    new_url = page.url
+                                    if "/device/link" not in new_url:
+                                        logger.info("Camoufox [%s]: moved to %s after API call ✓", label, new_url[:120])
+                                        clicked = True
+                                        break
+
+                                    logger.warning("Camoufox [%s]: could not link device on /device/link", label)
+                                    return "error"
+                                else:
+                                    # Moved away from /device/link — approval succeeded
+                                    logger.info("Camoufox [%s]: moved to %s — approval succeeded ✓", label, post_url[:120])
+                                    clicked = True
+                                    break
                             else:
                                 logger.info("Camoufox [%s]: no Continue btn on /device/link", label)
                             try:
